@@ -45,11 +45,13 @@ import {
 	type SubagentAgentConfig,
 	type SubagentSettings,
 	discoverAgents,
+	formatAgentList,
 } from "./agents.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
+const MAX_AGENTS_IN_DESCRIPTION = 20;
 const DEFAULT_TIMEOUT_MS = parsePositiveInteger(process.env.PI_SUBAGENT_TIMEOUT_MS) ?? 10 * 60 * 1000;
 const KILL_GRACE_MS = 5000;
 const STATUS_KEY = "subagents";
@@ -759,6 +761,17 @@ class ToolToggleList {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Discover available agents at registration time so the tool description
+	// can advertise the current roster to the model. The execute path
+	// re-validates against ctx.cwd, so this is an upper-bound hint that may
+	// be pruned at call time when agentScope is "user".
+	const initialAgentRoster = discoverAgents(process.cwd(), "both");
+	const initialAgentList = formatAgentList(initialAgentRoster.agents, MAX_AGENTS_IN_DESCRIPTION);
+	const agentsHint =
+		initialAgentList.remaining > 0
+			? `Available agents: ${initialAgentList.text}; ... +${initialAgentList.remaining} more.`
+			: `Available agents: ${initialAgentList.text}.`;
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -768,6 +781,7 @@ export default function (pi: ExtensionAPI) {
 			"Parallel mode may include an aggregator fan-in step that receives all task outputs.",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
+			agentsHint,
 		].join(" "),
 		promptSnippet:
 			"Delegate independent research, review, verification, or multi-step work to isolated Pi subagents.",
