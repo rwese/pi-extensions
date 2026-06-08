@@ -100,20 +100,34 @@ function publishSubagentStatus(ctx: StatusContext) {
 	ctx.ui.setStatus(STATUS_KEY, `${statuses[0]}${suffix}`);
 }
 
-function singleStatus(agent: string): string {
-	return `🧑‍🤝‍🧑 ${agent}`;
+function formatTimeout(timeoutMs: number): string {
+	if (timeoutMs < 1000) return `${timeoutMs}ms`;
+	if (timeoutMs < 60_000) return `${Math.round(timeoutMs / 1000)}s`;
+	const minutes = Math.round(timeoutMs / 60_000);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	const remainingMinutes = minutes % 60;
+	return remainingMinutes > 0 ? `${hours}h${remainingMinutes}m` : `${hours}h`;
 }
 
-function chainStatus(step: number, total: number, agent?: string): string {
-	return `🧑‍🤝‍🧑 chain ${step}/${total}${agent ? ` ${agent}` : ""}`;
+function formatTimeoutSuffix(timeoutMs: number | undefined): string {
+	return timeoutMs !== undefined ? ` (${formatTimeout(timeoutMs)})` : "";
 }
 
-function parallelStatus(done: number, total: number, running: number): string {
-	return `🧑‍🤝‍🧑 parallel ${done}/${total} done${running > 0 ? ` ${running} running` : ""}`;
+function singleStatus(agent: string, timeoutMs?: number): string {
+	return `🧑‍🤝‍🧑 ${agent}${formatTimeoutSuffix(timeoutMs)}`;
 }
 
-function fanInStatus(agent: string): string {
-	return `🧑‍🤝‍🧑 fan-in ${agent}`;
+function chainStatus(step: number, total: number, agent?: string, timeoutMs?: number): string {
+	return `🧑‍🤝‍🧑 chain ${step}/${total}${agent ? ` ${agent}` : ""}${formatTimeoutSuffix(timeoutMs)}`;
+}
+
+function parallelStatus(done: number, total: number, running: number, timeoutMs?: number): string {
+	return `🧑‍🤝‍🧑 parallel ${done}/${total} done${running > 0 ? ` ${running} running` : ""}${formatTimeoutSuffix(timeoutMs)}`;
+}
+
+function fanInStatus(agent: string, timeoutMs?: number): string {
+	return `🧑‍🤝‍🧑 fan-in ${agent}${formatTimeoutSuffix(timeoutMs)}`;
 }
 
 function formatTokens(count: number): string {
@@ -872,7 +886,9 @@ export default function (pi: ExtensionAPI) {
 				try {
 					for (let i = 0; i < params.chain.length; i++) {
 						const step = params.chain[i];
-						status.update(chainStatus(i + 1, params.chain.length, step.agent));
+						status.update(
+							chainStatus(i + 1, params.chain.length, step.agent, resolveTimeoutMs(step.agent, step.timeoutMs)),
+						);
 						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
 
 						// Create update callback that includes all previous results
@@ -937,7 +953,16 @@ export default function (pi: ExtensionAPI) {
 						details: makeDetails("parallel")([]),
 					};
 
-				const status = startSubagentStatus(ctx, toolCallId, parallelStatus(0, params.tasks.length, params.tasks.length));
+				// Use the longest resolved task timeout for the aggregate status line so
+				// the user can see when the last task is allowed to run.
+				const parallelMaxTimeoutMs = Math.max(
+					...params.tasks.map((t) => resolveTimeoutMs(t.agent, t.timeoutMs)),
+				);
+				const status = startSubagentStatus(
+					ctx,
+					toolCallId,
+					parallelStatus(0, params.tasks.length, params.tasks.length, parallelMaxTimeoutMs),
+				);
 
 				try {
 					// Track all results for streaming updates
@@ -961,7 +986,7 @@ export default function (pi: ExtensionAPI) {
 					let runningCount = params.tasks.length;
 
 					const emitParallelUpdate = () => {
-						status.update(parallelStatus(doneCount, allResults.length, runningCount));
+						status.update(parallelStatus(doneCount, allResults.length, runningCount, parallelMaxTimeoutMs));
 						if (onUpdate) {
 							onUpdate({
 								content: [
@@ -1004,7 +1029,8 @@ export default function (pi: ExtensionAPI) {
 					let aggregatorResult: SingleResult | undefined;
 					if (params.aggregator) {
 						const aggregator = params.aggregator;
-						status.update(fanInStatus(aggregator.agent));
+						const aggregatorTimeoutMs = resolveTimeoutMs(aggregator.agent, aggregator.timeoutMs);
+						status.update(fanInStatus(aggregator.agent, aggregatorTimeoutMs));
 						const fanInContext = buildFanInContext(results);
 						const aggregatorTask = aggregator.task.includes("{previous}")
 							? aggregator.task.replace(/\{previous\}/g, fanInContext)
@@ -1017,9 +1043,9 @@ export default function (pi: ExtensionAPI) {
 							aggregator.cwd,
 							undefined,
 							signal,
-							resolveTimeoutMs(aggregator.agent, aggregator.timeoutMs),
+							aggregatorTimeoutMs,
 							(partial) => {
-								status.update(fanInStatus(aggregator.agent));
+								status.update(fanInStatus(aggregator.agent, aggregatorTimeoutMs));
 								if (onUpdate && partial.details?.results[0]) {
 									onUpdate({
 										content: partial.content,
@@ -1063,7 +1089,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				const status = startSubagentStatus(ctx, toolCallId, singleStatus(params.agent));
+				const singleTimeoutMs = resolveTimeoutMs(params.agent, params.timeoutMs);
+				const status = startSubagentStatus(ctx, toolCallId, singleStatus(params.agent, singleTimeoutMs));
 
 				try {
 					const result = await runSingleAgent(
@@ -1074,7 +1101,7 @@ export default function (pi: ExtensionAPI) {
 						params.cwd,
 						undefined,
 						signal,
-						resolveTimeoutMs(params.agent, params.timeoutMs),
+						singleTimeoutMs,
 						onUpdate,
 						makeDetails("single"),
 					);
@@ -1105,21 +1132,34 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "user";
+			// Always show the effective timeout (top-level override, else
+			// DEFAULT_TIMEOUT_MS) so the user can see the budget that will
+			// actually apply to the subagent subprocess.
+			const topTimeoutSuffix = theme.fg(
+				"muted",
+				` (${formatTimeout(args.timeoutMs ?? DEFAULT_TIMEOUT_MS)})`,
+			);
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", ` [${scope}]`) +
+					topTimeoutSuffix;
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
 					const step = args.chain[i];
 					// Clean up {previous} placeholder for display
 					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
 					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
+					const stepTimeoutSuffix = theme.fg(
+						"muted",
+						` (${formatTimeout(step.timeoutMs ?? args.timeoutMs ?? DEFAULT_TIMEOUT_MS)})`,
+					);
 					text +=
 						"\n  " +
 						theme.fg("muted", `${i + 1}.`) +
 						" " +
 						theme.fg("accent", step.agent) +
+						stepTimeoutSuffix +
 						theme.fg("dim", ` ${preview}`);
 				}
 				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
@@ -1129,16 +1169,25 @@ export default function (pi: ExtensionAPI) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", ` [${scope}]`) +
+					topTimeoutSuffix;
 				for (const t of args.tasks.slice(0, 3)) {
 					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
-					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
+					const taskTimeoutSuffix = theme.fg(
+						"muted",
+						` (${formatTimeout(t.timeoutMs ?? args.timeoutMs ?? DEFAULT_TIMEOUT_MS)})`,
+					);
+					text += `\n  ${theme.fg("accent", t.agent)}${taskTimeoutSuffix}${theme.fg("dim", ` ${preview}`)}`;
 				}
 				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
 				if (args.aggregator) {
 					const preview =
 						args.aggregator.task.length > 40 ? `${args.aggregator.task.slice(0, 40)}...` : args.aggregator.task;
-					text += `\n  ${theme.fg("muted", "fan-in → ")}${theme.fg("accent", args.aggregator.agent)}${theme.fg(
+					const aggregatorTimeoutSuffix = theme.fg(
+						"muted",
+						` (${formatTimeout(args.aggregator.timeoutMs ?? args.timeoutMs ?? DEFAULT_TIMEOUT_MS)})`,
+					);
+					text += `\n  ${theme.fg("muted", "fan-in → ")}${theme.fg("accent", args.aggregator.agent)}${aggregatorTimeoutSuffix}${theme.fg(
 						"dim",
 						` ${preview}`,
 					)}`;
@@ -1150,7 +1199,8 @@ export default function (pi: ExtensionAPI) {
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
+				theme.fg("muted", ` [${scope}]`) +
+				topTimeoutSuffix;
 			text += `\n  ${theme.fg("dim", preview)}`;
 			return new Text(text, 0, 0);
 		},
