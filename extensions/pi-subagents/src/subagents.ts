@@ -52,15 +52,15 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const MAX_AGENTS_IN_DESCRIPTION = 20;
-const DEFAULT_TIMEOUT_MS = parsePositiveInteger(process.env.PI_SUBAGENT_TIMEOUT_MS) ?? 10 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = parseNonNegativeInteger(process.env.PI_SUBAGENT_TIMEOUT_MS) ?? 10 * 60 * 1000;
 const KILL_GRACE_MS = 5000;
 const STATUS_KEY = "subagents";
 const activeStatuses = new Map<string, string>();
 
-function parsePositiveInteger(value: string | undefined): number | undefined {
+function parseNonNegativeInteger(value: string | undefined): number | undefined {
 	if (!value) return undefined;
 	const parsed = Number.parseInt(value, 10);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 interface StatusContext {
@@ -101,6 +101,7 @@ function publishSubagentStatus(ctx: StatusContext) {
 }
 
 function formatTimeout(timeoutMs: number): string {
+	if (timeoutMs === 0) return "unlimited";
 	if (timeoutMs < 1000) return `${timeoutMs}ms`;
 	if (timeoutMs < 60_000) return `${Math.round(timeoutMs / 1000)}s`;
 	const minutes = Math.round(timeoutMs / 60_000);
@@ -463,10 +464,11 @@ async function runSingleAgent(
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			let settled = false;
+			let timeout: NodeJS.Timeout | undefined;
 			const finish = (code: number) => {
 				if (settled) return;
 				settled = true;
-				clearTimeout(timeout);
+				if (timeout) clearTimeout(timeout);
 				resolve(code);
 			};
 			const proc = spawn(invocation.command, invocation.args, {
@@ -476,16 +478,18 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			let buffer = "";
-			const timeout = setTimeout(() => {
-				timedOut = true;
-				currentResult.timedOut = true;
-				currentResult.stopReason = "timeout";
-				currentResult.errorMessage = `Subagent timed out after ${timeoutMs}ms`;
-				currentResult.stderr += `${currentResult.stderr ? "\n" : ""}Subagent timed out after ${timeoutMs}ms.`;
-				emitUpdate();
-				terminateProcess(proc);
-			}, timeoutMs);
-			timeout.unref();
+			if (timeoutMs > 0) {
+				timeout = setTimeout(() => {
+					timedOut = true;
+					currentResult.timedOut = true;
+					currentResult.stopReason = "timeout";
+					currentResult.errorMessage = `Subagent timed out after ${timeoutMs}ms`;
+					currentResult.stderr += `${currentResult.stderr ? "\n" : ""}Subagent timed out after ${timeoutMs}ms.`;
+					emitUpdate();
+					terminateProcess(proc);
+				}, timeoutMs);
+				timeout.unref();
+			}
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -580,8 +584,8 @@ async function runSingleAgent(
 
 const TimeoutMs = Type.Number({
 	description:
-		"Hard timeout in milliseconds for each subagent subprocess. Defaults to PI_SUBAGENT_TIMEOUT_MS or 600000.",
-	minimum: 1,
+		"Hard timeout in milliseconds for each subagent subprocess. 0 = unlimited. Defaults to PI_SUBAGENT_TIMEOUT_MS or 600000.",
+	minimum: 0,
 });
 
 const TaskItem = Type.Object({
