@@ -1166,11 +1166,14 @@ export default function (pi: ExtensionAPI) {
 				return new Text(text, 0, 0);
 			}
 			if (args.tasks && args.tasks.length > 0) {
+				// Calculate effective max timeout: use explicit top-level timeout, or the max of task timeouts.
+				const effectiveParallelTimeout = args.timeoutMs ?? Math.max(...args.tasks.map((t) => t.timeoutMs ?? DEFAULT_TIMEOUT_MS));
+				const parallelTimeoutSuffix = theme.fg("muted", ` (${formatTimeout(effectiveParallelTimeout)})`);
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
 					theme.fg("muted", ` [${scope}]`) +
-					topTimeoutSuffix;
+					parallelTimeoutSuffix;
 				for (const t of args.tasks.slice(0, 3)) {
 					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
 					const taskTimeoutSuffix = theme.fg(
