@@ -26,7 +26,7 @@ subagents.ts                                ← all of the above
 
 ### Phase 2 — Extract leaf modules
 
-- [ ] **P1.1** — Extract `src/core/types.ts` (UsageStats, SingleResult,
+- [x] **P1.1** — Extract `src/core/types.ts` (UsageStats, SingleResult,
       SubagentDetails, callbacks)
       Verify: `npm run check`; `wc -l src/subagents.ts` drops.
 
@@ -34,7 +34,8 @@ subagents.ts                                ← all of the above
 
 ### Phase 2 — Extract leaf modules
 
-- [ ] P1.2 — Extract `src/core/constants.ts` (max counts, timeouts, WRAP_UP_MESSAGE, parseNonNegativeInteger)
+- [ ] **P1.2** — Extract `src/core/constants.ts` (max counts, timeouts,
+      WRAP_UP_MESSAGE, parseNonNegativeInteger)
       Verify: `npm run check`; `rg "MAX_PARALLEL_TASKS" src/`.
 - [ ] P1.3 — Extract `src/core/status.ts` (STATUS_KEY, activeStatuses, startSubagentStatus, status helpers)
       Verify: `npm run check`; `rg "activeStatuses" src/`.

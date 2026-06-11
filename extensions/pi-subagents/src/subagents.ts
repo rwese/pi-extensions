@@ -54,24 +54,19 @@ import type {
 	SingleResult,
 	SubagentDetails,
 } from "./core/types.js";
+import {
+	COLLAPSED_ITEM_COUNT,
+	DEFAULT_TIMEOUT_MS,
+	KILL_GRACE_MS,
+	MAX_AGENTS_IN_DESCRIPTION,
+	MAX_CONCURRENCY,
+	MAX_PARALLEL_TASKS,
+	WRAP_UP_GRACE_MS,
+	WRAP_UP_MESSAGE,
+} from "./core/constants.js";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
-const COLLAPSED_ITEM_COUNT = 10;
-const MAX_AGENTS_IN_DESCRIPTION = 20;
-const DEFAULT_TIMEOUT_MS = parseNonNegativeInteger(process.env.PI_SUBAGENT_TIMEOUT_MS) ?? 10 * 60 * 1000;
-const KILL_GRACE_MS = 5000;
-const WRAP_UP_GRACE_MS = 5 * 60 * 1000;
-const WRAP_UP_MESSAGE =
-	"Subagent timeout approaching. Wrap up the current task and return a concise summary within 5 minutes, then exit.";
 const STATUS_KEY = "subagents";
 const activeStatuses = new Map<string, string>();
-
-function parseNonNegativeInteger(value: string | undefined): number | undefined {
-	if (!value) return undefined;
-	const parsed = Number.parseInt(value, 10);
-	return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
-}
 
 interface StatusContext {
 	ui: { setStatus: (key: string, value: string | undefined) => void };
