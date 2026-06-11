@@ -16,6 +16,7 @@ Use it to split research, planning, implementation, and review work across focus
 - Provides `/subagents:config` to persist per-agent tool allow-lists.
 - Supports per-task `cwd`, hard subprocess `timeoutMs`, abort propagation, and streaming progress.
 - Publishes transient runtime status through Pi's generic extension status API while subagents are running.
+- Tracks every subagent pid via an in-band `subagent_meta` custom message and reaps the full descendant process tree on timeout, abort, or wrap-up grace.
 - Returns complete worker output in tool details and a concise result for the main agent.
 
 ## 📦 Install
@@ -250,6 +251,8 @@ On timeout, the extension gives the subagent a chance to wrap up before hard-kil
 - A user-initiated abort (`AbortSignal` from the parent) takes precedence over both the notice and the grace window — the subprocess is terminated immediately.
 
 The subagent subprocess is spawned with `pi --mode rpc --no-session` so the wrap-up notice uses the documented `steer` RPC command. The 5-minute grace is currently fixed and not configurable.
+
+When the subagent is terminated (timeout/grace expiry or abort), the extension walks the descendant process tree rooted at the subagent's pid using `pgrep -P` recursively and sends `SIGTERM` (then `SIGKILL` after a 5s grace) to each descendant's process group. This catches nested sub-subagents the subagent itself spawned via the `subagent` tool — those run in their own detached process groups and would otherwise outlive their parent subagent. The subagent announces its pid and parent pid to the parent on startup via an in-band `subagent_meta` custom message so the parent can correlate the meta with the in-flight invocation.
 
 ## 📡 Runtime status
 

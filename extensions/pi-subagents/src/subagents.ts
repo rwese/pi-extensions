@@ -362,28 +362,134 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: "pi", args };
 }
 
-function terminateProcess(proc: ReturnType<typeof spawn>) {
-	if (proc.killed) return;
-	if (process.platform !== "win32" && proc.pid) {
-		try {
-			process.kill(-proc.pid, "SIGTERM");
-		} catch {
-			proc.kill("SIGTERM");
+/**
+ * Walk the process tree rooted at `rootPid` and return every
+ * descendant pid (including the root). Uses `pgrep -P` recursively
+ * on macOS and Linux. We walk by parent-pid (not by process group)
+ * so we catch sub-subagents that the subagent pi itself spawned
+ * with `detached: true` — those children are leaders of their own
+ * process groups and would be invisible to a negative-pgid SIGTERM.
+ *
+ * Windows is unsupported; the helper throws on win32 because we
+ * have not yet ported the walk to `wmic`/`tasklist`. The first
+ * terminateProcess on Windows falls back to the original
+ * single-process-group behavior.
+ */
+async function collectDescendantPids(rootPid: number): Promise<number[]> {
+	if (process.platform === "win32") {
+		throw new Error("collectDescendantPids: Windows not implemented");
+	}
+	if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
+
+	const out = new Set<number>([rootPid]);
+	const stack: number[] = [rootPid];
+	// Bound the walk so a pathological /proc with cycle references
+	// cannot hang the parent. Subagent trees are < 10 deep in
+	// practice; cap at 64 levels of nesting for safety.
+	const MAX_DEPTH = 64;
+	let depth = 0;
+	while (stack.length > 0 && depth < MAX_DEPTH) {
+		depth++;
+		// Snapshot current frontier; we'll push next-level children
+		// onto the same stack for BFS.
+		const frontier = stack.splice(0, stack.length);
+		for (const parent of frontier) {
+			const childrenStdout = await new Promise<string>((resolve) => {
+				const p = spawn("pgrep", ["-P", String(parent)], {
+					stdio: ["ignore", "pipe", "ignore"],
+					shell: false,
+				});
+				let buf = "";
+				p.stdout.on("data", (d) => {
+					buf += d.toString();
+				});
+				p.on("close", () => resolve(buf));
+				p.on("error", () => resolve(""));
+			});
+			for (const line of childrenStdout.split("\n")) {
+				const pid = Number.parseInt(line.trim(), 10);
+				if (Number.isFinite(pid) && pid > 0 && pid !== process.pid && !out.has(pid)) {
+					out.add(pid);
+					stack.push(pid);
+				}
+			}
 		}
+	}
+	return [...out];
+}
+
+function killProcessGroup(pid: number, signal: NodeJS.Signals) {
+	if (process.platform === "win32") {
+		try {
+			process.kill(pid, signal);
+		} catch {
+			/* gone */
+		}
+		return;
+	}
+	try {
+		// Negative pid = whole process group. process.kill(-pid) only
+		// reaches the group that the target leads; if the target is
+		// not a group leader, the kernel returns ESRCH and we fall
+		// back to a direct kill.
+		process.kill(-pid, signal);
+	} catch {
+		try {
+			process.kill(pid, signal);
+		} catch {
+			/* gone */
+		}
+	}
+}
+
+/**
+ * Terminate the subagent subprocess and all of its descendants.
+ *
+ * The subagent pi is spawned with `detached: true`, so it is the
+ * leader of its own process group. A bare `process.kill(-pid, ...)`
+ * only reaches that group — not any nested sub-subagents that the
+ * subagent pi spawned via the `subagent` tool (those are detached
+ * leaders of their own groups). We walk the descendant tree by
+ * ppid using `pgrep -P` and SIGTERM each node's process group, so
+ * a subagent and any grandchildren die together.
+ *
+ * Falls back to a single-process-group SIGTERM if the descendant
+ * walk fails (Windows, no `pgrep`, transient ps hiccup).
+ */
+async function terminateProcess(proc: ReturnType<typeof spawn>) {
+	if (proc.killed) return;
+	if (!proc.pid) {
+		try {
+			proc.kill("SIGTERM");
+		} catch {
+			/* gone */
+		}
+		return;
+	}
+
+	let targets: number[];
+	if (process.platform === "win32") {
+		// Windows descendant walk is unimplemented; fall back to
+		// single-process termination via the original signal-handler
+		// path (rpc-mode.js's killTrackedDetachedChildren runs on
+		// the child's SIGTERM).
+		targets = [proc.pid];
 	} else {
-		proc.kill("SIGTERM");
+		try {
+			const descendants = await collectDescendantPids(proc.pid);
+			targets = descendants.length > 0 ? descendants : [proc.pid];
+		} catch {
+			targets = [proc.pid];
+		}
+	}
+
+	for (const pid of targets) {
+		killProcessGroup(pid, "SIGTERM");
 	}
 
 	setTimeout(() => {
-		if (proc.killed) return;
-		if (process.platform !== "win32" && proc.pid) {
-			try {
-				process.kill(-proc.pid, "SIGKILL");
-			} catch {
-				proc.kill("SIGKILL");
-			}
-		} else {
-			proc.kill("SIGKILL");
+		for (const pid of targets) {
+			killProcessGroup(pid, "SIGKILL");
 		}
 	}, KILL_GRACE_MS).unref();
 }
@@ -475,6 +581,14 @@ async function runSingleAgent(
 			// we close stdin once the agent is done to let it exit. After
 			// that, the wrap-up notice is a no-op.
 			let agentEnded = false;
+			// Populated by processLine when the child emits its
+			// subagent_meta custom message. Used by terminateProcess to
+			// reap descendants of the child process group.
+			let childMeta: {
+				childPid: number;
+				parentPid: number | null;
+				childId: string | null;
+			} | null = null;
 			const finish = (code: number) => {
 				if (settled) return;
 				settled = true;
@@ -482,11 +596,20 @@ async function runSingleAgent(
 				if (graceTimer) clearTimeout(graceTimer);
 				resolve(code);
 			};
+			// Per-invocation uuid so the parent can correlate the meta
+			// event back to this runSingleAgent call even if pids are
+			// reused (rare, but possible after fast spawn/exit cycles).
+			const childId = crypto.randomUUID();
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				detached: process.platform !== "win32",
 				shell: false,
 				stdio: ["pipe", "pipe", "pipe"],
+				env: {
+					...process.env,
+					PI_SUBAGENT_PARENT_PID: String(process.pid),
+					PI_SUBAGENT_CHILD_ID: childId,
+				},
 			});
 
 			// Shared closure for the original timeoutMs site and the new grace
@@ -500,7 +623,10 @@ async function runSingleAgent(
 				currentResult.errorMessage = message;
 				currentResult.stderr += `${currentResult.stderr ? "\n" : ""}${message}.`;
 				emitUpdate();
-				terminateProcess(proc);
+				// Fire-and-forget: terminateProcess is async because it
+				// walks descendants via pgrep before SIGTERM. The grace
+				// timer that calls us is sync; we cannot await here.
+				terminateProcess(proc).catch(() => {});
 			};
 
 			let buffer = "";
@@ -535,6 +661,21 @@ async function runSingleAgent(
 				try {
 					event = JSON.parse(line);
 				} catch {
+					return;
+				}
+
+				// Recognize the subagent_meta custom message emitted by
+				// the child extension on startup. Stash the payload and
+				// skip pushing the message into currentResult.messages so
+				// the renderer never sees it. The parent uses childMeta
+				// in terminateProcess for accurate descendant reaping.
+				if (
+					event.type === "message_end" &&
+					event.message?.role === "custom" &&
+					event.message?.customType === "subagent_meta" &&
+					event.message?.details
+				) {
+					childMeta = event.message.details as typeof childMeta;
 					return;
 				}
 
@@ -603,7 +744,8 @@ async function runSingleAgent(
 					wasAborted = true;
 					currentResult.stopReason = "aborted";
 					currentResult.errorMessage = "Subagent was aborted";
-					terminateProcess(proc);
+					// Fire-and-forget; see markTimedOut.
+					terminateProcess(proc).catch(() => {});
 				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -827,6 +969,50 @@ class ToolToggleList {
 }
 
 export default function (pi: ExtensionAPI) {
+	// When spawned as a subagent, the parent passes two env vars:
+	//   PI_SUBAGENT_PARENT_PID — the parent's pi process pid
+	//   PI_SUBAGENT_CHILD_ID   — uuid for this specific invocation
+	// Announce our pid (and the parent pid we read back) on the RPC
+	// stream so the parent can track us and any descendants we spawn.
+	// The parent's processLine handles `customType: "subagent_meta"`
+	// specially: it stashes the payload and skips pushing it into
+	// currentResult.messages. The parent's renderer never sees the
+	// meta message, but its terminateProcess can read the recorded
+	// pid + parentPid for accurate descendant walking and logging.
+	//
+	// Why deferred: at registration time, the runtime's action
+	// methods (pi.sendMessage, etc.) are throwing stubs — they only
+	// become real after the parent calls bindCore on us. session_start
+	// and agent_start both fire after bindCore, so we use one of
+	// them. We pick agent_start: in RPC mode the subagent runs
+	// exactly one agent run (the initial prompt), so agent_start
+	// fires once and before the first assistant message_end. A
+	// `metaSent` guard prevents a duplicate if the session is later
+	// reloaded or re-prompted.
+	const childId = process.env.PI_SUBAGENT_CHILD_ID;
+	if (childId) {
+		const parentPidRaw = process.env.PI_SUBAGENT_PARENT_PID;
+		const parentPid = parentPidRaw ? Number.parseInt(parentPidRaw, 10) : null;
+		const parentPidNum = Number.isFinite(parentPid) ? (parentPid as number) : null;
+		let metaSent = false;
+		const emitMeta = () => {
+			if (metaSent) return;
+			metaSent = true;
+			pi.sendMessage({
+				customType: "subagent_meta",
+				content: "",
+				display: false,
+				details: {
+					childPid: process.pid,
+					parentPid: parentPidNum,
+					childId,
+				},
+			});
+		};
+		pi.on("session_start", emitMeta);
+		pi.on("agent_start", emitMeta);
+	}
+
 	// Discover available agents at registration time so the tool description
 	// can advertise the current roster to the model. The execute path
 	// re-validates against ctx.cwd, so this is an upper-bound hint that may
