@@ -21,6 +21,7 @@
 - Symptom: Chrome DevTools `/json/new` may reject unsafe `GET`. Cause: modern Chrome expects `PUT` for target creation. Fix: use `PUT /json/new?${encodeURIComponent(url)}`.
 - Symptom: Telegram bot polling can replay stale queued messages or conflict across Pi processes. Cause: `getUpdates` is a single bot-token queue controlled by offsets. Fix: discard pending updates on startup with an offset and run one active polling Pi per bot token.
 - For pi-sync on Cloudflare R2, keep session-token support for temporary credentials but retry once without the token when R2 static keys reject `X-Amz-Security-Token`.
+- pi-subagents: `collectDescendantPids` + `process.kill(-pid, ...)` is racy after a long grace window. Pids recycle; `proc.pid` is just a number after the subagent dies, and `pgrep -P <recycled_pid>` walks an unrelated tree. Verify the (pid, start_time) identity tuple before signaling, or fall back to killing the subagent's own process group captured at spawn time (`proc.pid === proc.pgid` because we spawn detached). Detached grandchildren also leak: when the subagent exits normally, they are reparented to PID 1 and the walker never runs — kill them on normal exit too.
 
 ## TASTE
 

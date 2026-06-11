@@ -16,7 +16,7 @@ Use it to split research, planning, implementation, and review work across focus
 - Provides `/subagents:config` to persist per-agent tool allow-lists.
 - Supports per-task `cwd`, hard subprocess `timeoutMs`, abort propagation, and streaming progress.
 - Publishes transient runtime status through Pi's generic extension status API while subagents are running.
-- Tracks every subagent pid via an in-band `subagent_meta` custom message and reaps the full descendant process tree on timeout, abort, or wrap-up grace.
+- Tracks every subagent pid via an in-band `subagent_meta` custom message and reaps the full descendant process tree on timeout, abort, or wrap-up grace; also reaps detached grandchildren that survive a normal exit, and verifies each candidate's `(pid, start_time)` identity before signaling to defend against pid recycling.
 - Returns complete worker output in tool details and a concise result for the main agent.
 
 ## 📦 Install
@@ -253,6 +253,13 @@ On timeout, the extension gives the subagent a chance to wrap up before hard-kil
 The subagent subprocess is spawned with `pi --mode rpc --no-session` so the wrap-up notice uses the documented `steer` RPC command. The 5-minute grace is currently fixed and not configurable.
 
 When the subagent is terminated (timeout/grace expiry or abort), the extension walks the descendant process tree rooted at the subagent's pid using `pgrep -P` recursively and sends `SIGTERM` (then `SIGKILL` after a 5s grace) to each descendant's process group. This catches nested sub-subagents the subagent itself spawned via the `subagent` tool — those run in their own detached process groups and would otherwise outlive their parent subagent. The subagent announces its pid and parent pid to the parent on startup via an in-band `subagent_meta` custom message so the parent can correlate the meta with the in-flight invocation.
+
+The reap path is hardened against two known races:
+
+- **Pid recycling.** The descendant walk verifies each candidate's `(pid, start_time)` identity tuple (read at spawn time) before signaling. If the subagent's pid was recycled between the spawn and the reap, the walk sees the live start time differs and skips the kill rather than targeting an unrelated process. macOS exposes start time via `ps -o lstart= -p <pid>`; Linux reads it from `/proc/<pid>/stat` field 22. Identity mismatches are silent in normal operation; set `PI_SUBAGENT_DEBUG_REAP=1` to log them to stderr.
+- **Detached grandchild leak on normal exit.** A subagent that backgrounded a detached grandchild (e.g. `bash -c "(sleep 30 &) ; echo done"`) used to leave that grandchild reparented to PID 1 when the subagent exited cleanly, because the reap only ran on timeout / abort. The extension now performs an additional `pgrep -P <subagent_pid>` walk in its `finally` block, verifies each candidate's identity tuple, and SIGKILLs any survivor. The walk is a single `pgrep` call that returns empty in the common case, so the cost is negligible. Set `PI_SUBAGENT_REAP_LEAKS=0` to disable the normal-exit reap for users who intentionally background long-running jobs from a subagent.
+
+The walker also refuses to walk from `PID 1` (which would be the entire system init tree) and from the parent pi's own pid, as defense-in-depth.
 
 ## 📡 Runtime status
 

@@ -13,6 +13,8 @@
  */
 
 import { spawn } from "node:child_process";
+import type { ChildProcessByStdio } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -453,6 +455,11 @@ async function collectDescendantPids(rootPid: number): Promise<number[]> {
 		throw new Error("collectDescendantPids: Windows not implemented");
 	}
 	if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
+	// Refuse to walk from PID 1 — that would be the entire system
+	// init tree, not a subagent's descendants. Defense in depth: the
+	// caller should never pass 1, but if some other code path does,
+	// the walker must not turn it into a system-wide kill.
+	if (rootPid === 1) return [];
 
 	const out = new Set<number>([rootPid]);
 	const stack: number[] = [rootPid];
@@ -491,6 +498,96 @@ async function collectDescendantPids(rootPid: number): Promise<number[]> {
 	return [...out];
 }
 
+/**
+ * Read a process's start time as a stable string identity for
+ * pid-recycling protection. A bare pid is just an integer; the
+ * kernel can recycle it within seconds under load. We pair each
+ * pid we captured at spawn time with a start-time string and
+ * re-verify before signaling, so a recycled pid can never trick
+ * us into killing an unrelated process.
+ *
+ *   - macOS:  `ps -o lstart= -p <pid>` — e.g. "Thu Jun 11 09:30:42 2026"
+ *   - Linux:  /proc/<pid>/stat field 22 (starttime in clock ticks
+ *             since boot). Clock ticks come from `getconf CLK_TCK`
+ *             (defaults to 100 on every modern Linux).
+ */
+async function readProcessStartTime(pid: number): Promise<string | null> {
+	if (!Number.isInteger(pid) || pid <= 0) return null;
+	if (process.platform === "darwin") {
+		return await new Promise<string | null>((resolve) => {
+			const p = spawn("ps", ["-o", "lstart=", "-p", String(pid)], {
+				stdio: ["ignore", "pipe", "ignore"],
+				shell: false,
+			});
+			let buf = "";
+			p.stdout.on("data", (d) => {
+				buf += d.toString();
+			});
+			p.on("close", () => resolve(buf.trim() || null));
+			p.on("error", () => resolve(null));
+		});
+	}
+	if (process.platform === "linux") {
+		const stat = await new Promise<string | null>((resolve) => {
+			fs.readFile(`/proc/${pid}/stat`, "utf-8", (err, data) => {
+				if (err) resolve(null);
+				else resolve(data);
+			});
+		});
+		if (!stat) return null;
+		// /proc/<pid>/stat has the format "pid (comm) state ppid pgrp
+		// session tty_nr tpgid flags minflt cminflt majflt cmajflt
+		// utime stime cutime cstime priority nice num_threads itrealvalue
+		// starttime vsize ...". The comm field can contain spaces and
+		// parens, so we split on the LAST ")". Field 22 (1-indexed) is
+		// starttime, which is the 22nd field AFTER the ")", i.e. the
+		// 20th whitespace-separated token after the ")".
+		const rpar = stat.lastIndexOf(")");
+		if (rpar < 0) return null;
+		const tail = stat.slice(rpar + 1).trim();
+		const fields = tail.split(/\s+/);
+		// tail starts with " state ppid pgrp ...", so starttime is at
+		// index 19 (state,ppid,pgrp,session,tty,tpgid,flags,minflt,
+		// cminflt,majflt,cmajflt,utime,stime,cutime,cstime,priority,
+		// nice,num_threads,itrealvalue,starttime).
+		const starttime = fields[19];
+		if (!starttime) return null;
+		return starttime;
+	}
+	return null;
+}
+
+/**
+ * Identity check: is `pid` still the same process whose start
+ * time we captured at spawn time? Returns false if the pid is
+ * gone, was recycled to an unrelated process, or if we cannot
+ * read its current start time.
+ */
+async function pidStillMatches(pid: number, capturedStartTime: string | null): Promise<boolean> {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	if (!capturedStartTime) return false;
+	// Liveness gate: ESCH => recycled or gone.
+	try {
+		process.kill(pid, 0);
+	} catch {
+		return false;
+	}
+	const live = await readProcessStartTime(pid);
+	return live !== null && live === capturedStartTime;
+}
+
+/** Opt-in debug breadcrumb for skipped / refused reaps. */
+function debugReap(message: string): void {
+	if (process.env.PI_SUBAGENT_DEBUG_REAP === "1") {
+		// stderr breadcrumb; never throw out of the reap path.
+		try {
+			process.stderr.write(`[pi-subagents] ${message}\n`);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
 function killProcessGroup(pid: number, signal: NodeJS.Signals) {
 	if (process.platform === "win32") {
 		try {
@@ -498,6 +595,15 @@ function killProcessGroup(pid: number, signal: NodeJS.Signals) {
 		} catch {
 			/* gone */
 		}
+		return;
+	}
+	// Refuse to signal the parent's own pid via the negative-pgid
+	// path. process.kill(-process.pid, ...) would signal the entire
+	// parent's process group, not a subagent's. If we ever do this
+	// by accident, the user would see their pi session die on the
+	// next reap. Guarded here at the bottom of the call stack.
+	if (pid === process.pid) {
+		debugReap(`killProcessGroup: refusing to signal parent's own pid ${pid}`);
 		return;
 	}
 	try {
@@ -526,12 +632,30 @@ function killProcessGroup(pid: number, signal: NodeJS.Signals) {
  * ppid using `pgrep -P` and SIGTERM each node's process group, so
  * a subagent and any grandchildren die together.
  *
- * Falls back to a single-process-group SIGTERM if the descendant
- * walk fails (Windows, no `pgrep`, transient ps hiccup).
+ * Three layers of safety against the pid-recycling race:
+ *
+ *  1. **Liveness gate**: `process.kill(proc.pid, 0)`. If the
+ *     subagent is already gone, skip the walker; just call
+ *     `reapLeftoverDescendants` for the leak fix.
+ *  2. **Identity gate**: re-read the live start time of `proc.pid`
+ *     and compare to the value captured at spawn time. If it
+ *     differs, the pid was recycled — skip the group-kill (we have
+ *     no idea what's there now).
+ *  3. **Walker fallback**: if the group-kill did not take within
+ *     `KILL_GRACE_MS`, the subagent must have detached
+ *     grandchildren holding the group open. Walk by ppid and
+ *     signal each one with the same identity check.
+ *
+ * Falls back to a single-process SIGTERM if the walk fails
+ * (Windows, no `pgrep`, transient ps hiccup).
  */
-async function terminateProcess(proc: ReturnType<typeof spawn>) {
+async function terminateProcess(
+	proc: ReturnType<typeof spawn>,
+	capturedStartTime: string | null,
+): Promise<void> {
 	if (proc.killed) return;
-	if (!proc.pid) {
+	const procPid = proc.pid;
+	if (!procPid) {
 		try {
 			proc.kill("SIGTERM");
 		} catch {
@@ -540,31 +664,124 @@ async function terminateProcess(proc: ReturnType<typeof spawn>) {
 		return;
 	}
 
-	let targets: number[];
+	// Liveness gate. If the subagent is already gone, we cannot
+	// kill its process group (the pid may be recycled) — just
+	// attempt a single reap pass for any detached grandchildren
+	// that escaped our process group at normal-exit time.
+	if (process.platform !== "win32") {
+		const alive = (() => {
+			try {
+				process.kill(procPid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		})();
+		if (!alive) {
+			await reapLeftoverDescendants(procPid, capturedStartTime);
+			return;
+		}
+		const stillOurs = await pidStillMatches(procPid, capturedStartTime);
+		if (!stillOurs) {
+			debugReap(`pid ${procPid} was recycled before terminate; skipping group kill`);
+			await reapLeftoverDescendants(procPid, capturedStartTime);
+			return;
+		}
+	}
+
 	if (process.platform === "win32") {
 		// Windows descendant walk is unimplemented; fall back to
 		// single-process termination via the original signal-handler
 		// path (rpc-mode.js's killTrackedDetachedChildren runs on
 		// the child's SIGTERM).
-		targets = [proc.pid];
-	} else {
-		try {
-			const descendants = await collectDescendantPids(proc.pid);
-			targets = descendants.length > 0 ? descendants : [proc.pid];
-		} catch {
-			targets = [proc.pid];
-		}
+		killProcessGroup(procPid, "SIGTERM");
+		setTimeout(() => killProcessGroup(procPid, "SIGKILL"), KILL_GRACE_MS).unref();
+		return;
 	}
 
-	for (const pid of targets) {
-		killProcessGroup(pid, "SIGTERM");
-	}
-
+	// Common case: subagent is a session leader (detached: true on
+	// POSIX) so its pid is its own pgid. One group-kill reaches
+	// the subagent + all non-detached children. No pgrep churn,
+	// no pid-recycling exposure in the hot path.
+	killProcessGroup(procPid, "SIGTERM");
 	setTimeout(() => {
-		for (const pid of targets) {
-			killProcessGroup(pid, "SIGKILL");
-		}
+		// After KILL_GRACE_MS, the subagent has had time to clean up.
+		// If it is still alive, the only way that can be true is that
+		// it has detached children holding the group open. Walk the
+		// tree, verify each candidate's identity, then SIGKILL the
+		// walkers. We do NOT SIGKILL the subagent itself here — it
+		// is a legitimate user-owned process; the user may have
+		// detoured it intentionally.
+		void reapDetachedSurvivors(proc, capturedStartTime);
 	}, KILL_GRACE_MS).unref();
+}
+
+/**
+ * Walk the descendant tree of `proc.pid`, verify each candidate
+ * against the captured start time, and SIGKILL any survivor that
+ * still matches. Used as the fallback inside `terminateProcess`
+ * after the group-kill grace window expires.
+ */
+async function reapDetachedSurvivors(
+	proc: ReturnType<typeof spawn>,
+	capturedStartTime: string | null,
+): Promise<void> {
+	if (!proc.pid) return;
+	let descendants: number[];
+	try {
+		descendants = await collectDescendantPids(proc.pid);
+	} catch {
+		return;
+	}
+	for (const pid of descendants) {
+		if (pid === proc.pid) continue;
+		const matches = await pidStillMatches(pid, capturedStartTime);
+		if (!matches) {
+			debugReap(`descendant pid ${pid} failed identity check; skipping`);
+			continue;
+		}
+		killProcessGroup(pid, "SIGKILL");
+	}
+}
+
+/**
+ * Best-effort reap of detached grandchildren that escaped the
+ * subagent's process group at normal-exit time (reparented to
+ * PID 1). Walks `pgrep -P <rootPid>` once, filters out the
+ * subagent itself, then for each candidate verifies the (pid,
+ * start_time) identity tuple before signaling. If the walker
+ * returns no candidates, this is a no-op.
+ *
+ * `PI_SUBAGENT_REAP_LEAKS=0` disables the behavior (for users
+ * who intentionally background long-running jobs from a subagent).
+ */
+async function reapLeftoverDescendants(
+	rootPid: number,
+	capturedStartTime: string | null,
+): Promise<void> {
+	if (process.env.PI_SUBAGENT_REAP_LEAKS === "0") return;
+	if (!Number.isInteger(rootPid) || rootPid <= 0) return;
+	if (rootPid === 1) return;
+	if (process.platform === "win32") return;
+	let descendants: number[];
+	try {
+		descendants = await collectDescendantPids(rootPid);
+	} catch {
+		return;
+	}
+	// Filter out the root itself — we only want grandchildren, not
+	// a re-kill of the subagent that already exited.
+	const targets = descendants.filter((p) => p !== rootPid);
+	if (targets.length === 0) return;
+	for (const pid of targets) {
+		const matches = await pidStillMatches(pid, capturedStartTime);
+		if (!matches) {
+			debugReap(`leak reap: pid ${pid} failed identity check; skipping`);
+			continue;
+		}
+		killProcessGroup(pid, "SIGKILL");
+	}
+	debugReap(`leak reap: signaled ${targets.length} detached descendant(s) of ${rootPid}`);
 }
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
@@ -609,6 +826,22 @@ async function runSingleAgent(
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
+	// Captured in the try block (after spawn resolves) so the
+	// finally block can reap any detached grandchildren that
+	// escaped the subagent's process group at normal-exit time.
+	// TypeScript's `try`/`finally` block scoping does not let the
+	// `finally` clause see `let` declarations from inside the
+	// `try` block, so we declare here and assign later. The type
+	// is the `stdio: ["pipe", "pipe", "pipe"]` overload's return
+	// type (`ChildProcessByStdio<Writable, Readable, Readable>`)
+	// so `proc.stdin.write` etc. are non-nullable inside the
+	// inner Promise callback.
+	let proc: ChildProcessByStdio<Writable, Readable, Readable> = null as unknown as ChildProcessByStdio<
+		Writable,
+		Readable,
+		Readable
+	>;
+	let subagentStartTime: string | null = null;
 
 	const currentResult: SingleResult = {
 		agent: agentName,
@@ -645,8 +878,32 @@ async function runSingleAgent(
 		let wasAborted = false;
 		let timedOut = false;
 
+		const invocation = getPiInvocation(args);
+		// Per-invocation uuid so the parent can correlate the meta
+		// event back to this runSingleAgent call even if pids are
+		// reused (rare, but possible after fast spawn/exit cycles).
+		const childId = crypto.randomUUID();
+		proc = spawn(invocation.command, invocation.args, {
+			cwd: cwd ?? defaultCwd,
+			detached: process.platform !== "win32",
+			shell: false,
+			stdio: ["pipe", "pipe", "pipe"],
+			env: {
+				...process.env,
+				PI_SUBAGENT_PARENT_PID: String(process.pid),
+				PI_SUBAGENT_CHILD_ID: childId,
+			},
+		}) as ChildProcessByStdio<Writable, Readable, Readable>;
+		// Capture the subagent's start time at spawn time. We use it
+		// as a stable identity tuple (pid, start_time) so a recycled
+		// pid can never trick us into killing an unrelated process in
+		// the descendant walk. Read it asynchronously after spawn
+		// returns; ps / /proc reads are fast (<5ms in practice).
+		subagentStartTime = proc.pid
+			? await readProcessStartTime(proc.pid).catch(() => null)
+			: null;
+
 		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
 			let settled = false;
 			let noticeTimer: NodeJS.Timeout | undefined;
 			let graceTimer: NodeJS.Timeout | undefined;
@@ -678,21 +935,6 @@ async function runSingleAgent(
 				if (countdownTimer) clearInterval(countdownTimer);
 				resolve(code);
 			};
-			// Per-invocation uuid so the parent can correlate the meta
-			// event back to this runSingleAgent call even if pids are
-			// reused (rare, but possible after fast spawn/exit cycles).
-			const childId = crypto.randomUUID();
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				detached: process.platform !== "win32",
-				shell: false,
-				stdio: ["pipe", "pipe", "pipe"],
-				env: {
-					...process.env,
-					PI_SUBAGENT_PARENT_PID: String(process.pid),
-					PI_SUBAGENT_CHILD_ID: childId,
-				},
-			});
 
 			// Shared closure for the original timeoutMs site and the new grace
 			// timer. Both paths mutate the same result fields and call
@@ -708,7 +950,7 @@ async function runSingleAgent(
 				// Fire-and-forget: terminateProcess is async because it
 				// walks descendants via pgrep before SIGTERM. The grace
 				// timer that calls us is sync; we cannot await here.
-				terminateProcess(proc).catch(() => {});
+				terminateProcess(proc, subagentStartTime).catch(() => {});
 			};
 
 			let buffer = "";
@@ -857,7 +1099,7 @@ async function runSingleAgent(
 					currentResult.stopReason = "aborted";
 					currentResult.errorMessage = "Subagent was aborted";
 					// Fire-and-forget; see markTimedOut.
-					terminateProcess(proc).catch(() => {});
+					terminateProcess(proc, subagentStartTime).catch(() => {});
 				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -881,6 +1123,19 @@ async function runSingleAgent(
 			} catch {
 				/* ignore */
 			}
+		// Normal-exit reap. If the subagent exited cleanly but
+		// backgrounded a detached grandchild (e.g. `bash -c "(sleep
+		// 30 &) ; echo done"`), the grandchild is reparented to PID
+		// 1 and the descendant walker inside terminateProcess
+		// never ran. Walk `pgrep -P <subagent_pid>` one more time
+		// here, verify each candidate's (pid, start_time) identity
+		// against the captured start time, and SIGKILL any
+		// survivor. The walker is bounded at MAX_DEPTH and a no-op
+		// if it finds nothing, so the common case is one `pgrep`
+		// call that returns empty.
+		if (proc?.pid) {
+			await reapLeftoverDescendants(proc.pid, subagentStartTime);
+		}
 	}
 }
 
