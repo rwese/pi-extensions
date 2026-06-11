@@ -42,24 +42,84 @@ set of focused modules under `src/`.
   repository-wide convention is `npm run check` as the gate).
 - Splitting `agents.ts` — it is already small and cohesive.
 
-## Target Module Layout
+## Target Module Layout (layered)
+
+Each subfolder is a layer. Imports flow strictly downward: `core` is
+the foundation, `format` and `process` build on it, `ui` is the
+TUI/command layer, `schema` defines the tool's input shape, and
+`subagents.ts` is the entry that wires them all into the extension
+API.
 
 ```
 extensions/pi-subagents/src/
-├── subagents.ts          # entry, default export, registerTool + registerCommand (~250 lines)
-├── agents.ts             # unchanged (already small)
-├── constants.ts          # MAX_PARALLEL_TASKS, MAX_CONCURRENCY, COLLAPSED_ITEM_COUNT, defaults, timeouts
-├── formatting.ts         # formatTimeout, formatCountdown, formatTokens, formatUsageStats, formatToolCall, status helpers
-├── messages.ts           # Message/DisplayItem helpers (getFinalOutput, getDisplayItems, buildFanInContext)
-├── settings.ts           # readSubagentSettings, saveSubagentConfig, normalizeSubagentSettings, hasOwn, isPlainObject, ...
-├── schema.ts             # SubagentParams + TaskItem/ChainItem/AggregatorItem/TimeoutMs/AgentScopeSchema
-├── status.ts             # startSubagentStatus, publishSubagentStatus, STATUS_KEY, activeStatuses
-├── process.ts            # getPiInvocation, writePromptToTempFile, terminateProcess, reapDetachedSurvivors, reapLeftoverDescendants, collectDescendantPids, readProcessStartTime, pidStillMatches, killProcessGroup, mapWithConcurrencyLimit, debugReap
-├── runner.ts             # runSingleAgent (the large function), getResultFinalOutput, type OnUpdateCallback/OnNoticeCallback
-├── render.ts             # formatToolCall moved here from formatting.ts? No — keep formatting.ts. renderCall, renderResult helpers (formatResultHeader, etc.) extracted to keep subagents.ts thin.
-├── ui-config.ts          # ToolToggleList class + the subagents:config command handler
-└── types.ts              # SingleResult, UsageStats, SubagentDetails (shared types)
+├── subagents.ts                 # entry, default export, registerTool + registerCommand wiring
+├── agents.ts                    # unchanged (already small, depends only on @earendil-works/pi-coding-agent)
+│
+├── core/                        # pure data + types + state, no I/O and no TUI
+│   ├── types.ts                 # UsageStats, SingleResult, SubagentDetails, OnUpdate/OnNotice callbacks
+│   ├── constants.ts             # MAX_PARALLEL_TASKS, MAX_CONCURRENCY, COLLAPSED_ITEM_COUNT, timeouts, WRAP_UP_MESSAGE
+│   ├── status.ts                # STATUS_KEY, activeStatuses, startSubagentStatus, publishSubagentStatus, *Status helpers
+│   ├── messages.ts              # getFinalOutput, getResultFinalOutput, getDisplayItems, buildFanInContext, DisplayItem
+│   └── settings.ts              # read/save/normalize SubagentSettings, type guards, hasOwn, sameToolSet, ...
+│
+├── format/                      # renderable strings (no I/O, no state)
+│   ├── formatting.ts            # formatTimeout, formatCountdown, formatUsageStats, formatToolCall, computeCountdownLabel
+│   └── render.ts                # formatResultHeader, renderDisplayItems, aggregateUsage, renderCall/renderResult helpers
+│
+├── process/                     # child process management
+│   ├── process.ts               # getPiInvocation, writePromptToTempFile, mapWithConcurrencyLimit, debugReap
+│   └── reap.ts                  # killProcessGroup, collectDescendantPids, readProcessStartTime, pidStillMatches,
+│                                # terminateProcess, reapDetachedSurvivors, reapLeftoverDescendants
+│                                # (separate file: this is the most safety-critical layer; deserves its own attention)
+│
+├── schema/                      # Typebox input schemas
+│   └── schema.ts                # TimeoutMs, TaskItem, ChainItem, AggregatorItem, AgentScopeSchema, SubagentParams
+│
+├── runner/                      # the orchestrator that glues everything per-invocation
+│   └── runner.ts                # runSingleAgent, OnUpdateCallback/OnNoticeCallback wiring
+│
+└── ui/                          # TUI components + commands
+    └── ui-config.ts             # ToolToggleList class + subagents:config command handler
 ```
+
+**Dependency graph (strictly downward; `subagents.ts` is the only file
+that imports across layers):**
+
+```
+agents.ts        (no internal deps)
+
+core/
+  types.ts       (no internal deps)
+  constants.ts   (no internal deps)
+  status.ts      → core/types, core/constants, format/formatting
+                   (uses formatTimeoutSuffix from format layer)
+  messages.ts    → core/types
+  settings.ts    → core/types, core/constants
+
+format/
+  formatting.ts  → core/types, core/constants
+  render.ts      → core/types, core/messages, format/formatting, core/constants
+
+process/
+  process.ts     → core/types, core/constants
+  reap.ts        → core/constants
+
+schema/
+  schema.ts      (no internal deps; only Typebox)
+
+runner/
+  runner.ts      → core/*, format/formatting, process/*
+
+ui/
+  ui-config.ts   → core/settings, core/types
+
+subagents.ts     → all of the above
+```
+
+Note: `core/status.ts` is the only core file that imports from
+`format/`. That is fine because the format layer is a pure-string
+layer with no I/O; the dependency arrow goes format ← core only in
+this one direction.
 
 Module boundaries chosen so each file:
 
@@ -91,145 +151,154 @@ Refactor order is chosen so each step keeps the package building: do
 not move a function before moving its dependencies, and verify with
 `npm run check` after every step.
 
-#### P1.1 — Extract `types.ts` (shared types)
+#### P1.1 — Extract `src/core/types.ts` (shared types)
 
 - **What:** move `UsageStats`, `SingleResult`, `SubagentDetails` and
   the `OnUpdateCallback` / `OnNoticeCallback` aliases into
-  `src/types.ts`. Import them in `subagents.ts` from there.
+  `src/core/types.ts`. Import them in `subagents.ts` from there.
 - **Why first:** every later extraction depends on these types, but
   extracting them does not change any function bodies, so the risk
   is essentially zero.
 - **Criteria:** `subagents.ts` no longer declares these types
-  locally; `types.ts` exports them; `npm run check` green.
+  locally; `core/types.ts` exports them; `npm run check` green.
 - **Verify:** `npm run check`; `wc -l src/subagents.ts` (down by ~30
   lines).
 
-#### P1.2 — Extract `constants.ts`
+#### P1.2 — Extract `src/core/constants.ts`
 
 - **What:** move `MAX_PARALLEL_TASKS`, `MAX_CONCURRENCY`,
   `COLLAPSED_ITEM_COUNT`, `MAX_AGENTS_IN_DESCRIPTION`,
   `DEFAULT_TIMEOUT_MS`, `KILL_GRACE_MS`, `WRAP_UP_GRACE_MS`,
   `WRAP_UP_MESSAGE`, and `parseNonNegativeInteger` into
-  `src/constants.ts`. `subagents.ts` re-imports them.
+  `src/core/constants.ts`. `subagents.ts` re-imports them.
 - **Criteria:** `npm run check` green; constant values match the
   pre-refactor source verbatim.
 - **Verify:** `npm run check`; `rg "MAX_PARALLEL_TASKS" src/` should
-  show definitions in `constants.ts` and references in
+  show definitions in `core/constants.ts` and references in
   `subagents.ts` only.
 
-#### P1.3 — Extract `status.ts`
+#### P1.3 — Extract `src/core/status.ts`
 
 - **What:** move `STATUS_KEY`, `activeStatuses`, `StatusContext`,
   `startSubagentStatus`, `publishSubagentStatus` into
-  `src/status.ts`. Also move the `singleStatus`, `chainStatus`,
-  `parallelStatus`, `fanInStatus` helpers and the per-status
-  `formatTimeoutSuffix` helper. Keep `formatTimeout` in
-  `formatting.ts` to avoid a status → formatting cycle.
+  `src/core/status.ts`. Also move the `singleStatus`, `chainStatus`,
+  `parallelStatus`, `fanInStatus` helpers.
+- **`formatTimeoutSuffix` lives in `format/formatting.ts`** and is
+  imported by `core/status.ts` (downward dep, allowed).
 - **Criteria:** `npm run check` green.
 - **Verify:** `npm run check`; `rg "activeStatuses" src/` should show
-  definition in `status.ts`.
+  definition in `core/status.ts`.
 
-#### P1.4 — Extract `formatting.ts`
+#### P1.4 — Extract `src/format/formatting.ts`
 
 - **What:** move `formatTimeout`, `formatTimeoutSuffix`,
   `formatCountdown`, `formatTokens`, `formatUsageStats`,
-  `formatToolCall` into `src/formatting.ts`. Move
-  `computeCountdownLabel` (depends on `SingleResult`, `WRAP_UP_GRACE_MS`,
-  `formatCountdown`).
+  `formatToolCall` into `src/format/formatting.ts`. Move
+  `computeCountdownLabel` (depends on `SingleResult`,
+  `WRAP_UP_GRACE_MS`, `formatCountdown`).
+- **Note:** `formatTimeoutSuffix` is shared with `core/status.ts`;
+  define it in `format/formatting.ts` and re-import it from
+  `core/status.ts` (downward dependency, allowed).
 - **Criteria:** `npm run check` green; `formatToolCall` is still
   callable from `subagents.ts`'s `renderResult` without behaviour
   change.
 - **Verify:** `npm run check`; `rg "function formatTimeout" src/`
-  shows the definition in `formatting.ts` only.
+  shows the definition in `format/formatting.ts` only.
 
-#### P1.5 — Extract `messages.ts`
+#### P1.5 — Extract `src/core/messages.ts`
 
 - **What:** move `DisplayItem`, `getDisplayItems`,
   `getFinalOutput`, `getResultFinalOutput`, `buildFanInContext` into
-  `src/messages.ts`. These are pure functions over `Message[]` and
-  `SingleResult`.
+  `src/core/messages.ts`. These are pure functions over `Message[]`
+  and `SingleResult`.
 - **Criteria:** `npm run check` green.
 - **Verify:** `npm run check`; `rg "function getFinalOutput" src/`
-  shows the definition in `messages.ts` only.
+  shows the definition in `core/messages.ts` only.
 
-#### P1.6 — Extract `settings.ts`
+#### P1.6 — Extract `src/core/settings.ts`
 
 - **What:** move `readSubagentSettings`, `saveSubagentConfig`,
   `normalizeSubagentSettings`, `normalizeAgentSettings`,
   `hasOwn`, `isPlainObject`, `isStringArray`, `isPositiveNumber`,
   `uniqueToolNames`, `sameToolSet`, `hasAnyAgentOverride` into
-  `src/settings.ts`. Note: `hasOwn` is also used by `agents.ts` —
-  re-export it from `settings.ts` and have `agents.ts` import it
-  from there to remove duplication. (Verified during extraction;
-  if `agents.ts` already has its own local `hasOwn`, replace it
-  with the import.)
+  `src/core/settings.ts`. Note: `hasOwn` is also used by
+  `agents.ts` — re-export it from `core/settings.ts` and have
+  `agents.ts` import it from there to remove duplication.
 - **Criteria:** `npm run check` green; `agents.ts` no longer
   declares `hasOwn` locally.
 - **Verify:** `npm run check`; `rg "function hasOwn" src/`.
 
-#### P1.7 — Extract `process.ts` (process management helpers)
+#### P1.7 — Extract `src/process/process.ts` (process management)
 
 - **What:** move `mapWithConcurrencyLimit`, `writePromptToTempFile`,
-  `getPiInvocation`, `collectDescendantPids`,
-  `readProcessStartTime`, `pidStillMatches`, `debugReap`,
-  `killProcessGroup`, `terminateProcess`, `reapDetachedSurvivors`,
-  `reapLeftoverDescendants` into `src/process.ts`. `subagents.ts`
-  re-imports them. Update `subagents.ts`'s child-meta comment
-  accordingly.
-- **Note:** this is the largest extraction and the only one that
-  crosses a `ChildProcessByStdio` type boundary. Verify the import
-  set in `process.ts` matches the imports that were local to
-  those functions.
+  `getPiInvocation`, `debugReap` into
+  `src/process/process.ts`.
+- **Criteria:** `npm run check` green.
+- **Verify:** `npm run check`; `rg "function getPiInvocation" src/`
+  shows the definition in `process/process.ts` only.
+
+#### P1.8 — Extract `src/process/reap.ts` (descendant reaping)
+
+- **What:** move `collectDescendantPids`, `readProcessStartTime`,
+  `pidStillMatches`, `killProcessGroup`, `terminateProcess`,
+  `reapDetachedSurvivors`, `reapLeftoverDescendants` into
+  `src/process/reap.ts`. This is the most safety-critical layer
+  (pid recycling, signal handling); isolating it makes the
+  next code review easier.
+- **Note:** the runner needs `terminateProcess`; the entry needs
+  nothing directly from this file. Confirm at extraction time.
 - **Criteria:** `npm run check` green.
 - **Verify:** `npm run check`; `rg "function terminateProcess" src/`
-  shows the definition in `process.ts` only.
+  shows the definition in `process/reap.ts` only.
 
-#### P1.8 — Extract `runner.ts` (`runSingleAgent`)
+#### P1.9 — Extract `src/runner/runner.ts` (`runSingleAgent`)
 
-- **What:** move `runSingleAgent` into `src/runner.ts`. It depends on
-  almost everything we have already extracted (`constants.ts`,
-  `messages.ts`, `process.ts`, `formatting.ts`, `types.ts`), which
-  is why this is intentionally last in the leaf phase.
+- **What:** move `runSingleAgent` into `src/runner/runner.ts`. It
+  depends on almost everything we have already extracted
+  (`core/constants`, `core/messages`, `core/status`,
+  `format/formatting`, `process/process`, `process/reap`,
+  `core/types`), which is why this is intentionally last in the
+  leaf phase.
 - **Criteria:** `npm run check` green; `runSingleAgent` is exported
-  from `runner.ts` and called from `subagents.ts`.
+  from `runner/runner.ts` and called from `subagents.ts`.
 - **Verify:** `npm run check`; `rg "function runSingleAgent" src/`.
 
-#### P1.9 — Extract `schema.ts`
+#### P1.10 — Extract `src/schema/schema.ts`
 
 - **What:** move `TimeoutMs`, `TaskItem`, `ChainItem`,
   `AggregatorItem`, `AgentScopeSchema`, `SubagentParams` into
-  `src/schema.ts`. Keep all `description` strings verbatim.
+  `src/schema/schema.ts`. Keep all `description` strings verbatim.
 - **Criteria:** `npm run check` green; schema is exported and
   consumed by `subagents.ts`'s `registerTool`.
 - **Verify:** `npm run check`; `rg "SubagentParams" src/`.
 
-#### P1.10 — Extract `render.ts` (rendering helpers)
+#### P1.11 — Extract `src/format/render.ts` (rendering helpers)
 
 - **What:** the `renderCall` and `renderResult` bodies in
   `subagents.ts` are large but tightly coupled to the surrounding
-  tool shape. Extract pure helpers into `src/render.ts`:
+  tool shape. Extract pure helpers into `src/format/render.ts`:
   - `formatResultHeader(r, icon, theme, isError, countdownSuffix)`
-  - `formatParallelHeader(...)` and
-    `formatChainHeader(...)` if they reduce duplication
+  - `formatParallelHeader(...)` and `formatChainHeader(...)` if
+    they reduce duplication
   - `renderDisplayItems(items, theme, expanded, limit)` (already a
     local closure — promote to module level)
   - `aggregateUsage(results)` (already a local closure)
 - Keep the `renderCall` and `renderResult` methods in
-  `subagents.ts` so `registerTool` stays in one place; they delegate
-  to the helpers in `render.ts`.
-- **Criteria:** `npm run check` green; `render.ts` exports the
-  helpers; `subagents.ts`'s `renderCall`/`renderResult` are visibly
-  shorter.
+  `subagents.ts` so `registerTool` stays in one place; they
+  delegate to the helpers in `format/render.ts`.
+- **Criteria:** `npm run check` green; `format/render.ts` exports
+  the helpers; `subagents.ts`'s `renderCall`/`renderResult` are
+  visibly shorter.
 - **Verify:** `npm run check`; `wc -l src/subagents.ts` should drop
   by 100+ lines.
 
-#### P1.11 — Extract `ui-config.ts` (configuration command)
+#### P1.12 — Extract `src/ui/ui-config.ts` (configuration command)
 
 - **What:** move `ToolToggleList` class and the
   `subagents:config` command handler out of the default-export
-  function into `src/ui-config.ts`. Export a `registerConfigCommand`
-  function that takes `pi: ExtensionAPI` and performs the
-  registration; call it from `subagents.ts`.
+  function into `src/ui/ui-config.ts`. Export a
+  `registerConfigCommand` function that takes `pi: ExtensionAPI`
+  and performs the registration; call it from `subagents.ts`.
 - **Criteria:** `npm run check` green; the
   `subagents:config` command still registers with the same
   description and behaviour.
@@ -314,7 +383,7 @@ not move a function before moving its dependencies, and verify with
 **Order first, not time.**
 
 - P0.1 — confirm baseline is green.
-- P1.1 — extract `types.ts`. This is the smallest testable
+- P1.1 — extract `core/types.ts`. This is the smallest testable
   increment: zero functional change, but `wc -l src/subagents.ts`
   drops, and `npm run check` must still pass.
 
