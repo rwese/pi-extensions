@@ -69,24 +69,24 @@ subagents.ts                                ← all of the above
 - [x] **P1.11** — Extract `src/format/render.ts` (formatResultHeader,
       renderDisplayItems, aggregateUsage, etc.)
       Verify: `npm run check`; `wc -l src/subagents.ts` drops.
-- [ ] **P1.12** — Extract `src/ui/ui-config.ts` (ToolToggleList,
+- [x] **P1.12** — Extract `src/ui/ui-config.ts` (ToolToggleList,
       subagents:config command handler)
       Verify: `npm run check`; `rg "registerCommand" src/`.
 
 ### Phase 3 — Verification
 
-- [ ] P2.1 — `npm run check` green across the workspace.
-- [ ] P2.2 — Smoke import. Manual step: run `just try-subagents` to
+- [ ] **P2.1** — `npm run check` green across the workspace.
+- [ ] **P2.2** — Smoke import. Manual step: run `just try-subagents` to
       confirm the extension loads. (Cannot be automated in this
       harness; user to confirm.)
-- [ ] P2.3 — `wc -l src/**/*.ts src/*.ts`: every file < 500 lines,
+- [ ] **P2.3** — `wc -l src/**/*.ts src/*.ts`: every file < 500 lines,
       `subagents.ts` < 350 lines.
 
 ### Phase 4 — Handoff
 
-- [ ] P3.1 — Commit on `refactor_subagents` with a Conventional Commits
+- [ ] **P3.1** — Commit on `refactor_subagents` with a Conventional Commits
       message. Do not merge to `main`; await user review.
-- [ ] P3.2 — Update `MEMORY.md` only if a non-obvious gotcha surfaces.
+- [ ] **P3.2** — Update `MEMORY.md` only if a non-obvious gotcha surfaces.
 
 ## Blocked
 
