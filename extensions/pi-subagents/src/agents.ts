@@ -19,6 +19,7 @@ export interface AgentConfig {
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
+	disabled?: boolean;
 }
 
 export interface SubagentAgentConfig {
@@ -149,6 +150,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			systemPrompt: body,
 			source,
 			filePath,
+			disabled: parseBooleanFlag(frontmatter.disabled),
 		});
 	}
 
@@ -161,6 +163,13 @@ function isDirectory(p: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+const TRUTHY_BOOLEAN_FLAGS = new Set(["true", "1", "yes", "on"]);
+
+function parseBooleanFlag(value: string | undefined): boolean | undefined {
+	if (value === undefined) return undefined;
+	return TRUTHY_BOOLEAN_FLAGS.has(value.trim().toLowerCase());
 }
 
 function findNearestProjectAgentsDir(cwd: string): string | null {
@@ -197,13 +206,24 @@ export function discoverAgents(
 	// pattern in ./src: stable built-ins plus overridable local definitions.
 	for (const agent of BUILT_IN_AGENTS) agentMap.set(agent.name, agent);
 
+	const apply = (agent: AgentConfig) => {
+		if (agent.disabled) {
+			// A disabled file shadows the same name and removes it from the
+			// roster. This is how a user or project agent opts out of a
+			// built-in (or another inherited agent) without code changes.
+			agentMap.delete(agent.name);
+			return;
+		}
+		agentMap.set(agent.name, agent);
+	};
+
 	if (scope === "both") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+		for (const agent of userAgents) apply(agent);
+		for (const agent of projectAgents) apply(agent);
 	} else if (scope === "user") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
+		for (const agent of userAgents) apply(agent);
 	} else {
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+		for (const agent of projectAgents) apply(agent);
 	}
 
 	// Apply user-configured overrides (from /subagents:config) on top of

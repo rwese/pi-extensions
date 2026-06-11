@@ -156,7 +156,7 @@ Run a chain where each step receives the previous output:
 
 ## 🤖 Built-in agents
 
-Built-in agents are available without setup and can be overridden by user or project agents with the same name.
+Built-in agents are available without setup and can be overridden by user or project agents with the same name. To opt a built-in out entirely, see [Disabling agents](#-disabling-agents).
 
 | Agent | Purpose | Tools |
 | --- | --- | --- |
@@ -203,6 +203,33 @@ test coverage, and migration risks. Report PASS/FAIL/PARTIAL with evidence.
 ```
 
 By default, `subagent` loads user agents only. Set `agentScope` to `"project"` or `"both"` to load project-local agents. Interactive sessions ask for confirmation before using project agents unless `confirmProjectAgents` is disabled.
+
+### 🚫 Disabling agents
+
+Set `disabled: true` in an agent's frontmatter to remove it from the roster.
+A disabled file shadows any agent with the same name — built-in or otherwise
+— instead of overriding it. This is how you opt a built-in out without forking
+the extension.
+
+Truthy values: `true`, `1`, `yes`, `on` (case-insensitive). Anything else, or
+a missing key, leaves the agent enabled.
+
+```markdown
+---
+name: planner
+description: Disabled by user preference; see scout for lightweight planning.
+disabled: true
+---
+
+The body of a disabled file is ignored; only `name` and `disabled` are required
+in practice, but `description` is still required by the loader.
+```
+
+`discoverAgents` removes the name from the agent map, so the `subagent` tool
+description, the per-call agent resolution in `runSingleAgent`, and the
+`/subagents:config` picker all skip it. Existing `pi-subagents-config.json`
+overrides for a now-disabled agent are silently ignored, matching the behavior
+for any other unknown name.
 
 ## ⏱️ Runtime limits
 
