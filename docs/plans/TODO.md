@@ -34,14 +34,22 @@ subagents.ts                                ← all of the above
 
 ### Phase 2 — Extract leaf modules
 
-- [ ] **P1.2** — Extract `src/core/constants.ts` (max counts, timeouts,
+- [x] **P1.2** — Extract `src/core/constants.ts` (max counts, timeouts,
       WRAP_UP_MESSAGE, parseNonNegativeInteger)
       Verify: `npm run check`; `rg "MAX_PARALLEL_TASKS" src/`.
-- [ ] P1.3 — Extract `src/core/status.ts` (STATUS_KEY, activeStatuses, startSubagentStatus, status helpers)
+- [x] **P1.3** — Extract `src/core/status.ts` (STATUS_KEY, activeStatuses,
+      startSubagentStatus, status helpers).
+      **Note:** done after P1.4 because `core/status.ts` imports
+      `formatTimeoutSuffix` from `format/formatting.ts` (downward
+      dep, allowed).
       Verify: `npm run check`; `rg "activeStatuses" src/`.
-- [ ] P1.4 — Extract `src/format/formatting.ts` (formatTimeout, formatCountdown, formatUsageStats, formatToolCall, computeCountdownLabel)
+- [x] **P1.4** — Extract `src/format/formatting.ts` (formatTimeout,
+      formatCountdown, formatUsageStats, formatToolCall,
+      computeCountdownLabel) — done first so P1.3 can import
+      `formatTimeoutSuffix` from it.
       Verify: `npm run check`; `rg "function formatTimeout" src/`.
-- [ ] P1.5 — Extract `src/core/messages.ts` (DisplayItem, getDisplayItems, getFinalOutput, getResultFinalOutput, buildFanInContext)
+- [ ] **P1.5** — Extract `src/core/messages.ts` (DisplayItem, getDisplayItems,
+      getFinalOutput, getResultFinalOutput, buildFanInContext)
       Verify: `npm run check`; `rg "function getFinalOutput" src/`.
 - [ ] P1.6 — Extract `src/core/settings.ts` (read/save/normalize settings, type guards, hasOwn, sameToolSet, etc.)
       Verify: `npm run check`; `rg "function hasOwn" src/`.
