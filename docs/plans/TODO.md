@@ -57,11 +57,11 @@ subagents.ts                                ← all of the above
 - [x] **P1.7** — Extract `src/process/process.ts` (mapWithConcurrencyLimit,
       writePromptToTempFile, getPiInvocation, debugReap)
       Verify: `npm run check`; `rg "function getPiInvocation" src/`.
-- [ ] **P1.8** — Extract `src/process/reap.ts` (killProcessGroup,
+- [x] **P1.8** — Extract `src/process/reap.ts` (killProcessGroup,
       collectDescendantPids, readProcessStartTime, pidStillMatches,
       terminateProcess, reapDetachedSurvivors, reapLeftoverDescendants)
       Verify: `npm run check`; `rg "function terminateProcess" src/`.
-- [ ] P1.9 — Extract `src/runner/runner.ts` (runSingleAgent)
+- [ ] **P1.9** — Extract `src/runner/runner.ts` (runSingleAgent)
       Verify: `npm run check`; `rg "function runSingleAgent" src/`.
 - [ ] P1.10 — Extract `src/schema/schema.ts` (TimeoutMs, TaskItem, ChainItem, AggregatorItem, AgentScopeSchema, SubagentParams)
       Verify: `npm run check`; `rg "SubagentParams" src/`.
