@@ -24,15 +24,19 @@ subagents.ts                                ← all of the above
 
 ## In Progress
 
+_(none — all tasks complete; awaiting user review)_
+
+## Ready
+
+_(none — all tasks complete; awaiting user review)_
+
+## Done (all phases)
+
 ### Phase 2 — Extract leaf modules
 
 - [x] **P1.1** — Extract `src/core/types.ts` (UsageStats, SingleResult,
       SubagentDetails, callbacks)
       Verify: `npm run check`; `wc -l src/subagents.ts` drops.
-
-## Ready
-
-### Phase 2 — Extract leaf modules
 
 - [x] **P1.2** — Extract `src/core/constants.ts` (max counts, timeouts,
       WRAP_UP_MESSAGE, parseNonNegativeInteger)
@@ -120,7 +124,11 @@ subagents.ts                                ← all of the above
       (P1.1 through P1.12). `git log --oneline` on the branch
       shows 13 new commits. `git status` is clean. No merge to
       `main`.
-- [ ] **P3.2** — Update `MEMORY.md` only if a non-obvious gotcha surfaces.
+- [x] **P3.2** — `MEMORY.md` updated with one entry under
+      `## GOTCHA` documenting that layered refactors inside an
+      extension should keep the public surface stable, and a
+      static export-name check is a useful non-TTY smoke test
+      when `just try-<pkg>` needs an interactive TTY.
 
 ## Blocked
 
