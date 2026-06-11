@@ -5,6 +5,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { hasOwn } from "./core/settings.js";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -189,10 +190,6 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 		if (parentDir === currentDir) return null;
 		currentDir = parentDir;
 	}
-}
-
-function hasOwn(obj: object, key: PropertyKey): boolean {
-	return Object.hasOwn(obj, key);
 }
 
 export function discoverAgents(

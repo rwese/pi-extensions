@@ -51,10 +51,11 @@ subagents.ts                                ← all of the above
 - [x] **P1.5** — Extract `src/core/messages.ts` (DisplayItem, getDisplayItems,
       getFinalOutput, getResultFinalOutput, buildFanInContext)
       Verify: `npm run check`; `rg "function getFinalOutput" src/`.
-- [ ] **P1.6** — Extract `src/core/settings.ts` (read/save/normalize
+- [x] **P1.6** — Extract `src/core/settings.ts` (read/save/normalize
       settings, type guards, hasOwn, sameToolSet, etc.)
       Verify: `npm run check`; `rg "function hasOwn" src/`.
-- [ ] P1.7 — Extract `src/process/process.ts` (mapWithConcurrencyLimit, writePromptToTempFile, getPiInvocation, debugReap)
+- [ ] **P1.7** — Extract `src/process/process.ts` (mapWithConcurrencyLimit,
+      writePromptToTempFile, getPiInvocation, debugReap)
       Verify: `npm run check`; `rg "function getPiInvocation" src/`.
 - [ ] P1.8 — Extract `src/process/reap.ts` (killProcessGroup, collectDescendantPids, readProcessStartTime, pidStillMatches, terminateProcess, reapDetachedSurvivors, reapLeftoverDescendants)
       Verify: `npm run check`; `rg "function terminateProcess" src/`.
