@@ -9,7 +9,7 @@ Use it to split research, planning, implementation, and review work across focus
 ## ✨ Features
 
 - Registers a `subagent` tool for single-agent, parallel, fan-in, and chained delegation.
-- Runs workers as isolated `pi --mode json -p --no-session` subprocesses.
+- Runs workers as isolated `pi --mode rpc --no-session` subprocesses.
 - Supports built-in `scout`, `planner`, `reviewer`, and `worker` agents.
 - Loads custom user agents from `~/.pi/agent/agents/*.md`.
 - Optionally loads project agents from `.pi/agents/*.md` with confirmation.
@@ -240,9 +240,16 @@ Each subprocess has a hard timeout to avoid runaway workers.
 - Set `timeoutMs` on the top-level call to apply a default for all jobs.
 - Set `timeoutMs` on a task, chain step, or aggregator to override it locally.
 - If omitted, the default is `PI_SUBAGENT_TIMEOUT_MS`, or `3600000` milliseconds (1 hour) when unset.
-- Set `timeoutMs: 0` for unlimited (no timeout).
+- Set `timeoutMs: 0` for unlimited (no timeout). No notice, no grace.
 
-On timeout, the extension sends `SIGTERM`, escalates to `SIGKILL` after a short grace period, and returns any partial messages or stderr collected so far.
+On timeout, the extension gives the subagent a chance to wrap up before hard-killing it:
+
+- At the `timeoutMs` threshold, a wrap-up notice is sent to the still-running subagent asking it to return a concise summary and exit. The status line is updated to `🧑‍🤝‍🧑 <agent> wrapping up (5m)` so the user can see the notice landed.
+- The subagent then has a fixed 5-minute grace window to finish its current turn and respond. If it does, the subagent's own final text is returned (no extra result fields are added).
+- If the grace window expires, the subprocess is terminated with `SIGTERM`, escalating to `SIGKILL` after a short period, and any partial messages or stderr collected so far are returned with `stopReason: "timeout"`.
+- A user-initiated abort (`AbortSignal` from the parent) takes precedence over both the notice and the grace window — the subprocess is terminated immediately.
+
+The subagent subprocess is spawned with `pi --mode rpc --no-session` so the wrap-up notice uses the documented `steer` RPC command. The 5-minute grace is currently fixed and not configurable.
 
 ## 📡 Runtime status
 

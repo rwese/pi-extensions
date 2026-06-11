@@ -54,6 +54,9 @@ const COLLAPSED_ITEM_COUNT = 10;
 const MAX_AGENTS_IN_DESCRIPTION = 20;
 const DEFAULT_TIMEOUT_MS = parseNonNegativeInteger(process.env.PI_SUBAGENT_TIMEOUT_MS) ?? 10 * 60 * 1000;
 const KILL_GRACE_MS = 5000;
+const WRAP_UP_GRACE_MS = 5 * 60 * 1000;
+const WRAP_UP_MESSAGE =
+	"Subagent timeout approaching. Wrap up the current task and return a concise summary within 5 minutes, then exit.";
 const STATUS_KEY = "subagents";
 const activeStatuses = new Map<string, string>();
 
@@ -386,6 +389,7 @@ function terminateProcess(proc: ReturnType<typeof spawn>) {
 }
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
+type OnNoticeCallback = (agentName: string) => void;
 
 async function runSingleAgent(
 	defaultCwd: string,
@@ -398,6 +402,7 @@ async function runSingleAgent(
 	timeoutMs: number,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	onNotice: OnNoticeCallback | undefined,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -416,7 +421,7 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	const args: string[] = ["--mode", "rpc", "--no-session"];
 	if (agent.model) args.push("--model", agent.model);
 	if (Array.isArray(agent.tools)) {
 		if (agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
@@ -457,38 +462,71 @@ async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${task}`);
 		let wasAborted = false;
 		let timedOut = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			let settled = false;
-			let timeout: NodeJS.Timeout | undefined;
+			let noticeTimer: NodeJS.Timeout | undefined;
+			let graceTimer: NodeJS.Timeout | undefined;
+			// Track whether the agent has already produced a final agent_end
+			// event. RPC mode keeps the subprocess alive after agent_end, so
+			// we close stdin once the agent is done to let it exit. After
+			// that, the wrap-up notice is a no-op.
+			let agentEnded = false;
 			const finish = (code: number) => {
 				if (settled) return;
 				settled = true;
-				if (timeout) clearTimeout(timeout);
+				if (noticeTimer) clearTimeout(noticeTimer);
+				if (graceTimer) clearTimeout(graceTimer);
 				resolve(code);
 			};
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				detached: process.platform !== "win32",
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe"],
 			});
+
+			// Shared closure for the original timeoutMs site and the new grace
+			// timer. Both paths mutate the same result fields and call
+			// terminateProcess. The notice timer only fires the steer + grace;
+			// the grace timer fires this.
+			const markTimedOut = (message: string) => {
+				timedOut = true;
+				currentResult.timedOut = true;
+				currentResult.stopReason = "timeout";
+				currentResult.errorMessage = message;
+				currentResult.stderr += `${currentResult.stderr ? "\n" : ""}${message}.`;
+				emitUpdate();
+				terminateProcess(proc);
+			};
+
 			let buffer = "";
+
+			// Initial prompt. RPC mode consumes commands as JSON lines on stdin
+			// and emits AgentSessionEvent objects on stdout. Use the documented
+			// `prompt` command so the subprocess uses its normal model/tool flow.
+			proc.stdin.write(`${JSON.stringify({ type: "prompt", message: `Task: ${task}` })}\n`);
+
 			if (timeoutMs > 0) {
-				timeout = setTimeout(() => {
-					timedOut = true;
-					currentResult.timedOut = true;
-					currentResult.stopReason = "timeout";
-					currentResult.errorMessage = `Subagent timed out after ${timeoutMs}ms`;
-					currentResult.stderr += `${currentResult.stderr ? "\n" : ""}Subagent timed out after ${timeoutMs}ms.`;
-					emitUpdate();
-					terminateProcess(proc);
+				// At the timeoutMs threshold, deliver a one-shot wrap-up steer
+				// to the subprocess and schedule the hard-kill for the grace
+				// window. The subprocess gets a chance to finish its current
+				// turn and return a summary. The hard-kill timer is cleared
+				// by `finish` if the subprocess exits before then.
+				noticeTimer = setTimeout(() => {
+					if (proc.killed || proc.exitCode !== null || agentEnded) return;
+					proc.stdin.write(`${JSON.stringify({ type: "steer", message: WRAP_UP_MESSAGE })}\n`);
+					if (onNotice) onNotice(agentName);
+					graceTimer = setTimeout(
+						() => markTimedOut(`Subagent timed out after ${timeoutMs}ms + ${WRAP_UP_GRACE_MS}ms grace`),
+						WRAP_UP_GRACE_MS,
+					);
+					graceTimer.unref();
 				}, timeoutMs);
-				timeout.unref();
+				noticeTimer.unref();
 			}
 
 			const processLine = (line: string) => {
@@ -502,6 +540,10 @@ async function runSingleAgent(
 
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
+					// RPC mode emits message_end for user, assistant, and
+					// toolResult roles. Tool results arrive as a single
+					// message_end with role "toolResult" instead of a
+					// separate tool_result_end event.
 					currentResult.messages.push(msg);
 
 					if (msg.role === "assistant") {
@@ -522,9 +564,15 @@ async function runSingleAgent(
 					emitUpdate();
 				}
 
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
+				// RPC mode keeps the subprocess alive across turns. When the
+				// agent emits agent_end, the work is done — close stdin so
+				// the subprocess shuts down cleanly via its onInputEnd
+				// handler. The proc.on("close") listener then resolves the
+				// promise. We only close once; subsequent agent_end events
+				// (e.g. after a wrap-up steer) are no-ops.
+				if (event.type === "agent_end" && !agentEnded) {
+					agentEnded = true;
+					proc.stdin.end();
 				}
 			};
 
@@ -921,6 +969,7 @@ export default function (pi: ExtensionAPI) {
 							resolveTimeoutMs(step.agent, step.timeoutMs),
 							chainUpdate,
 							makeDetails("chain"),
+							(noticedAgent) => status.update(`🧑‍🤝‍🧑 ${noticedAgent} wrapping up (5m)`),
 						);
 						results.push(result);
 
@@ -1022,6 +1071,7 @@ export default function (pi: ExtensionAPI) {
 								}
 							},
 							makeDetails("parallel"),
+							(noticedAgent) => status.update(`🧑‍🤝‍🧑 ${noticedAgent} wrapping up (5m)`),
 						);
 						allResults[index] = result;
 						doneCount += 1;
@@ -1058,6 +1108,7 @@ export default function (pi: ExtensionAPI) {
 								}
 							},
 							makeDetails("parallel"),
+							(noticedAgent) => status.update(`🧑‍🤝‍🧑 ${noticedAgent} wrapping up (5m)`),
 						);
 					}
 
@@ -1108,6 +1159,7 @@ export default function (pi: ExtensionAPI) {
 						singleTimeoutMs,
 						onUpdate,
 						makeDetails("single"),
+						(noticedAgent) => status.update(`🧑‍🤝‍🧑 ${noticedAgent} wrapping up (5m)`),
 					);
 					const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 					if (isError) {
