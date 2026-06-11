@@ -78,52 +78,13 @@ import {
 	singleStatus,
 	startSubagentStatus,
 } from "./core/status.js";
-
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
-function getResultFinalOutput(result: SingleResult): string {
-	return result.finalOutput ?? getFinalOutput(result.messages);
-}
-
-function buildFanInContext(results: SingleResult[]): string {
-	return results
-		.map((result, index) => {
-			const status = result.exitCode === 0 ? "completed" : result.exitCode === -1 ? "running" : "failed";
-			const output = getResultFinalOutput(result);
-			const error = result.errorMessage || result.stderr.trim();
-			return [
-				`## Result ${index + 1}: ${result.agent} (${status})`,
-				`Task: ${result.task}`,
-				output ? `Output:\n${output}` : error ? `Error:\n${error}` : "Output: (no output)",
-			].join("\n\n");
-		})
-		.join("\n\n---\n\n");
-}
-
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
-
-function getDisplayItems(messages: Message[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
-			}
-		}
-	}
-	return items;
-}
+import {
+	type DisplayItem,
+	buildFanInContext,
+	getDisplayItems,
+	getFinalOutput,
+	getResultFinalOutput,
+} from "./core/messages.js";
 
 async function mapWithConcurrencyLimit<TIn, TOut>(
 	items: TIn[],
