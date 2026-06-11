@@ -211,8 +211,10 @@ A disabled file shadows any agent with the same name — built-in or otherwise
 — instead of overriding it. This is how you opt a built-in out without forking
 the extension.
 
-Truthy values: `true`, `1`, `yes`, `on` (case-insensitive). Anything else, or
-a missing key, leaves the agent enabled.
+Truthy values: `true`, `1`, `yes`, `on` (case-insensitive). Recognized as
+falsy but currently treated the same as a missing key (agent stays enabled):
+`false`, `0`, `no`, `off`. Anything else leaves the agent enabled. YAML
+booleans, numbers, and strings are all accepted.
 
 ```markdown
 ---

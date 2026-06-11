@@ -166,10 +166,17 @@ function isDirectory(p: string): boolean {
 }
 
 const TRUTHY_BOOLEAN_FLAGS = new Set(["true", "1", "yes", "on"]);
+const FALSY_BOOLEAN_FLAGS = new Set(["false", "0", "no", "off"]);
 
-function parseBooleanFlag(value: string | undefined): boolean | undefined {
-	if (value === undefined) return undefined;
-	return TRUTHY_BOOLEAN_FLAGS.has(value.trim().toLowerCase());
+function parseBooleanFlag(value: unknown): boolean | undefined {
+	// YAML scalars come through parseFrontmatter typed as string but can
+	// actually be booleans, numbers, or null. Coerce to a string before
+	// matching so we never call .trim() on a non-string.
+	if (value === null || value === undefined) return undefined;
+	const text = typeof value === "string" ? value.trim().toLowerCase() : String(value).trim().toLowerCase();
+	if (TRUTHY_BOOLEAN_FLAGS.has(text)) return true;
+	if (FALSY_BOOLEAN_FLAGS.has(text)) return false;
+	return undefined;
 }
 
 function findNearestProjectAgentsDir(cwd: string): string | null {
