@@ -22,6 +22,7 @@
 - Symptom: Telegram bot polling can replay stale queued messages or conflict across Pi processes. Cause: `getUpdates` is a single bot-token queue controlled by offsets. Fix: discard pending updates on startup with an offset and run one active polling Pi per bot token.
 - For pi-sync on Cloudflare R2, keep session-token support for temporary credentials but retry once without the token when R2 static keys reject `X-Amz-Security-Token`.
 - pi-subagents: `collectDescendantPids` + `process.kill(-pid, ...)` is racy after a long grace window. Pids recycle; `proc.pid` is just a number after the subagent dies, and `pgrep -P <recycled_pid>` walks an unrelated tree. Verify the (pid, start_time) identity tuple before signaling, or fall back to killing the subagent's own process group captured at spawn time (`proc.pid === proc.pgid` because we spawn detached). Detached grandchildren also leak: when the subagent exits normally, they are reparented to PID 1 and the walker never runs — kill them on normal exit too.
+- For layered refactors inside an extension: keep the public surface stable. The package's `pi.extensions` entry, the default export of the entry file, and the named exports of any helper module imported by the entry must all stay byte-identical at the import level. A static export-name check (e.g. a small Node script that greps each module's `export (function|const|class|type|interface) NAME`) is a useful non-TTY smoke test when `just try-<pkg>` requires an interactive TTY.
 
 ## TASTE
 
