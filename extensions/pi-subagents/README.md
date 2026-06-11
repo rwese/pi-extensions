@@ -239,7 +239,7 @@ Each subprocess has a hard timeout to avoid runaway workers.
 
 - Set `timeoutMs` on the top-level call to apply a default for all jobs.
 - Set `timeoutMs` on a task, chain step, or aggregator to override it locally.
-- If omitted, the default is `PI_SUBAGENT_TIMEOUT_MS`, or `600000` milliseconds (10 minutes) when unset.
+- If omitted, the default is `PI_SUBAGENT_TIMEOUT_MS`, or `3600000` milliseconds (1 hour) when unset.
 - Set `timeoutMs: 0` for unlimited (no timeout).
 
 On timeout, the extension sends `SIGTERM`, escalates to `SIGKILL` after a short grace period, and returns any partial messages or stderr collected so far.
