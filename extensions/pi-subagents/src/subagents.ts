@@ -18,7 +18,6 @@ import type { Readable, Writable } from "node:stream";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -49,6 +48,12 @@ import {
 	discoverAgents,
 	formatAgentList,
 } from "./agents.js";
+import type {
+	OnNoticeCallback,
+	OnUpdateCallback,
+	SingleResult,
+	SubagentDetails,
+} from "./core/types.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -298,51 +303,6 @@ function formatToolCall(
 			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
 		}
 	}
-}
-
-interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
-	turns: number;
-}
-
-interface SingleResult {
-	agent: string;
-	agentSource: AgentSource | "unknown";
-	task: string;
-	exitCode: number;
-	messages: Message[];
-	stderr: string;
-	usage: UsageStats;
-	model?: string;
-	stopReason?: string;
-	errorMessage?: string;
-	step?: number;
-	finalOutput?: string;
-	timedOut?: boolean;
-	timeoutMs?: number;
-	/** Wall-clock ms when this subagent invocation started. Used by the
-	 *  renderer to draw a live "time left" countdown against
-	 *  `startedAt + timeoutMs` (or `startedAt + timeoutMs + WRAP_UP_GRACE_MS`
-	 *  once the wrap-up notice has fired). */
-	startedAt?: number;
-	/** Wall-clock ms when the wrap-up notice was delivered to the subagent.
-	 *  Undefined before the notice fires; set inside the notice timer's body
-	 *  so the renderer can switch the countdown from "X left" to
-	 *  "grace: X left" without re-deriving from the constant. */
-	wrapUpStartedAt?: number;
-}
-
-interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
-	agentScope: AgentScope;
-	projectAgentsDir: string | null;
-	results: SingleResult[];
-	aggregator?: SingleResult;
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -783,9 +743,6 @@ async function reapLeftoverDescendants(
 	}
 	debugReap(`leak reap: signaled ${targets.length} detached descendant(s) of ${rootPid}`);
 }
-
-type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
-type OnNoticeCallback = (agentName: string) => void;
 
 async function runSingleAgent(
 	defaultCwd: string,

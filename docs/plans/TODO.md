@@ -24,22 +24,16 @@ subagents.ts                                ← all of the above
 
 ## In Progress
 
-_(none)_
+### Phase 2 — Extract leaf modules
+
+- [ ] **P1.1** — Extract `src/core/types.ts` (UsageStats, SingleResult,
+      SubagentDetails, callbacks)
+      Verify: `npm run check`; `wc -l src/subagents.ts` drops.
 
 ## Ready
 
-### Phase 1 — Setup
-
-- [ ] P0.1 — Document plan and confirm baseline
-      Criteria: plan file exists, `git status` clean,
-      `npm run check` exits 0.
-- [ ] P0.2 — Add this TODO.md tracker
-      Criteria: file exists with the four sections.
-
 ### Phase 2 — Extract leaf modules
 
-- [ ] P1.1 — Extract `src/core/types.ts` (UsageStats, SingleResult, SubagentDetails, callbacks)
-      Verify: `npm run check`; `wc -l src/subagents.ts` drops.
 - [ ] P1.2 — Extract `src/core/constants.ts` (max counts, timeouts, WRAP_UP_MESSAGE, parseNonNegativeInteger)
       Verify: `npm run check`; `rg "MAX_PARALLEL_TASKS" src/`.
 - [ ] P1.3 — Extract `src/core/status.ts` (STATUS_KEY, activeStatuses, startSubagentStatus, status helpers)
@@ -88,3 +82,7 @@ _(none)_
       (layered layout: `src/{core,format,process,schema,runner,ui}/*`).
 - [x] Worktree `refactor_subagents` confirmed; `main` untouched.
 - [x] Baseline `npm run check` confirmed green (43 files, 0 errors).
+- [x] P0.1 — Document plan and confirm baseline
+      (plan file exists, `git status` clean, `npm run check` exits 0).
+- [x] P0.2 — Add this TODO.md tracker (file exists with the four
+      sections per the planning template).
