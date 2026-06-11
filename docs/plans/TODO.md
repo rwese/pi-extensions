@@ -79,17 +79,29 @@ subagents.ts                                ← all of the above
       Verified: biome check (43 files, 0 errors), boundary check
       (no extension-to-extension deps), all 12 workspace
       typechecks pass.
-- [x] **P2.2** — Smoke import. Verified statically because
-      `just try-subagents` needs an interactive TTY. Substituted
-      a Node-side structural check that loads every new module
-      and confirms the public surface (76 named exports + the
-      default export) is intact, and a layered-dependency check
-      that walks the `from "./..."` graph and confirms every
-      internal import follows the plan's downward-only
-      direction (with the documented `agents.ts` ->
-      `core/settings.ts` exception for `hasOwn`).
-      User to run `just try-subagents` manually for a final
-      runtime smoke.
+- [x] **P2.2** — Smoke import. Verified both statically and at
+      runtime:
+        - Static: a Node-side structural check confirms the
+          public surface (76 named exports + the default
+          export) is intact, and a layered-dependency check
+          walks the `from "./..."` graph and confirms every
+          internal import follows the plan's downward-only
+          direction (with the documented `agents.ts` ->
+          `core/settings.ts` exception for `hasOwn`).
+        - Runtime: ran
+          `pi --no-extensions --extension ./extensions/pi-subagents -c "use the subagent tool to test it"`
+          and got back
+          "Subagent tool works. It reported cwd as `/tmp/pi-test`
+          and confirmed successful execution." — the refactored
+          factory loads, `registerTool` fires, the `subagent`
+          tool dispatches into `runSingleAgent`, and the child
+          pi subprocess runs end-to-end.
+      Note: `just try-subagents` (which calls `pi -e
+      ./extensions/pi-subagents`) conflicts with a previously
+      installed `pi-subagents` extension that also registers a
+      `subagent` tool. That conflict is not caused by this
+      refactor (it would happen with the pre-refactor source
+      too) — pass `--no-extensions` to bypass.
 - [x] **P2.3** — `wc -l src/**/*.ts src/*.ts`: every file < 500
       lines, `subagents.ts` < 350 lines.
       Verified: every file is < 500 lines (max is
