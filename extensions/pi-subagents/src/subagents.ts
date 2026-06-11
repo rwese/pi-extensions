@@ -93,52 +93,12 @@ import {
 	saveSubagentConfig,
 	uniqueToolNames,
 } from "./core/settings.js";
-
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
-
-async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-
-	return { command: "pi", args };
-}
+import {
+	debugReap,
+	getPiInvocation,
+	mapWithConcurrencyLimit,
+	writePromptToTempFile,
+} from "./process/process.js";
 
 /**
  * Walk the process tree rooted at `rootPid` and return every
@@ -277,18 +237,6 @@ async function pidStillMatches(pid: number, capturedStartTime: string | null): P
 	}
 	const live = await readProcessStartTime(pid);
 	return live !== null && live === capturedStartTime;
-}
-
-/** Opt-in debug breadcrumb for skipped / refused reaps. */
-function debugReap(message: string): void {
-	if (process.env.PI_SUBAGENT_DEBUG_REAP === "1") {
-		// stderr breadcrumb; never throw out of the reap path.
-		try {
-			process.stderr.write(`[pi-subagents] ${message}\n`);
-		} catch {
-			/* ignore */
-		}
-	}
 }
 
 function killProcessGroup(pid: number, signal: NodeJS.Signals) {
