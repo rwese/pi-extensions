@@ -69,6 +69,7 @@ import {
 	formatToolCall,
 	formatUsageStats,
 } from "./format/formatting.js";
+import { aggregateUsage, renderDisplayItems } from "./format/render.js";
 import {
 	chainStatus,
 	fanInStatus,
@@ -658,22 +659,6 @@ export default function (pi: ExtensionAPI) {
 
 			const mdTheme = getMarkdownTheme();
 
-			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
-				const toShow = limit ? items.slice(-limit) : items;
-				const skipped = limit && items.length > limit ? items.length - limit : 0;
-				let text = "";
-				if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
-				for (const item of toShow) {
-					if (item.type === "text") {
-						const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-						text += `${theme.fg("toolOutput", preview)}\n`;
-					} else {
-						text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
-					}
-				}
-				return text.trimEnd();
-			};
-
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
 				const isError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
@@ -734,26 +719,13 @@ export default function (pi: ExtensionAPI) {
 				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
 				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 				else {
-					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
+					text += `\n${renderDisplayItems(displayItems, theme, expanded, COLLAPSED_ITEM_COUNT)}`;
 					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
 				const usageStr = formatUsageStats(r.usage, r.model);
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
 				return new Text(text, 0, 0);
 			}
-
-			const aggregateUsage = (results: SingleResult[]) => {
-				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-				for (const r of results) {
-					total.input += r.usage.input;
-					total.output += r.usage.output;
-					total.cacheRead += r.usage.cacheRead;
-					total.cacheWrite += r.usage.cacheWrite;
-					total.cost += r.usage.cost;
-					total.turns += r.usage.turns;
-				}
-				return total;
-			};
 
 			if (details.mode === "chain") {
 				const successCount = details.results.filter((r) => r.exitCode === 0).length;
@@ -838,7 +810,7 @@ export default function (pi: ExtensionAPI) {
 					const countdownSuffix = countdown ? ` ${theme.fg("warning", countdown)}` : "";
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}${countdownSuffix}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
+					else text += `\n${renderDisplayItems(displayItems, theme, expanded, 5)}`;
 				}
 				const usageStr = formatUsageStats(aggregateUsage(details.results));
 				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
@@ -980,7 +952,7 @@ export default function (pi: ExtensionAPI) {
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}${countdownSuffix}`;
 					if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
+					else text += `\n${renderDisplayItems(displayItems, theme, expanded, 5)}`;
 				}
 				if (aggregator) {
 					const rIcon =
@@ -995,7 +967,7 @@ export default function (pi: ExtensionAPI) {
 					text += `\n\n${theme.fg("muted", "─── fan-in → ")}${theme.fg("accent", aggregator.agent)} ${rIcon}${aggCountdownSuffix}`;
 					if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", aggregator.exitCode === -1 ? "(running...)" : "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
+					else text += `\n${renderDisplayItems(displayItems, theme, expanded, 5)}`;
 				}
 				if (!isRunning) {
 					const usageResults = aggregator ? [...details.results, aggregator] : details.results;

@@ -66,10 +66,11 @@ subagents.ts                                ← all of the above
 - [x] **P1.10** — Extract `src/schema/schema.ts` (TimeoutMs, TaskItem,
       ChainItem, AggregatorItem, AgentScopeSchema, SubagentParams)
       Verify: `npm run check`; `rg "SubagentParams" src/`.
-- [ ] **P1.11** — Extract `src/format/render.ts` (formatResultHeader,
+- [x] **P1.11** — Extract `src/format/render.ts` (formatResultHeader,
       renderDisplayItems, aggregateUsage, etc.)
       Verify: `npm run check`; `wc -l src/subagents.ts` drops.
-- [ ] P1.12 — Extract `src/ui/ui-config.ts` (ToolToggleList, subagents:config command handler)
+- [ ] **P1.12** — Extract `src/ui/ui-config.ts` (ToolToggleList,
+      subagents:config command handler)
       Verify: `npm run check`; `rg "registerCommand" src/`.
 
 ### Phase 3 — Verification
