@@ -134,6 +134,69 @@ function fanInStatus(agent: string, timeoutMs?: number): string {
 	return `🧑‍🤝‍🧑 fan-in ${agent}${formatTimeoutSuffix(timeoutMs)}`;
 }
 
+/**
+ * Compact `H:MM:SS` / `M:SS` / `Ss` countdown formatter. `totalMs` is the
+ * remaining duration in milliseconds; values <= 0 render as `0s`. Used by
+ * the renderer to draw a single live timer per subagent invocation. We
+ * pick clock-style (`2:13`, `0:45`) over the bulkier `2m 13s` form because
+ * the tag has to fit comfortably next to the agent name in the per-row
+ * header.
+ */
+function formatCountdown(totalMs: number): string {
+	const seconds = Math.max(0, Math.floor(totalMs / 1000));
+	const hours = Math.floor(seconds / 3600);
+	const minutes = Math.floor((seconds % 3600) / 60);
+	const secs = seconds % 60;
+	if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+	if (minutes > 0) return `${minutes}:${String(secs).padStart(2, "0")}`;
+	return `${secs}s`;
+}
+
+/**
+ * Decide what (if anything) the renderer's per-row countdown tag should
+ * say for `r`, evaluated at `now`. Returns `null` when no tag should be
+ * drawn: the subagent finished voluntarily, was aborted, was hard-killed
+ * by the grace timer, was given an unlimited budget, or has no recorded
+ * start time.
+ *
+ * The two non-null cases are:
+ *   - Pre-notice countdown:    `⏱ <time left>` against
+ *                              `startedAt + timeoutMs`.
+ *   - In-grace countdown:      `⏱ grace: <time left>` against
+ *                              `startedAt + timeoutMs + WRAP_UP_GRACE_MS`.
+ *
+ * `wrapUpStartedAt` is the canonical signal that we are inside the grace
+ * window — it is set inside the notice timer's body, not derived from the
+ * `WRAP_UP_GRACE_MS` constant — so the renderer does not need to know the
+ * grace length and stays decoupled from the timer constants.
+ */
+function computeCountdownLabel(r: SingleResult, now: number): string | null {
+	if (!r.startedAt || !r.timeoutMs || r.timeoutMs <= 0) return null;
+	// Drop the tag once the invocation is over. The renderer also drops it
+	// when `!isPartial`, but checking the result fields keeps the helper
+	// safe for callers that don't pass isPartial.
+	if (r.timedOut) return null;
+	if (r.stopReason === "aborted" || r.stopReason === "error") return null;
+	const graceDeadline = r.startedAt + r.timeoutMs + WRAP_UP_GRACE_MS;
+	if (r.wrapUpStartedAt) {
+		// The wrap-up notice has fired. We are somewhere in the
+		// [notice, notice + WRAP_UP_GRACE_MS] window. The deadline
+		// for the grace kill is `graceDeadline`; we render a "grace:"
+		// countdown against that.
+		const left = graceDeadline - now;
+		return `⏱ grace: ${formatCountdown(left)}`;
+	}
+	const deadline = r.startedAt + r.timeoutMs;
+	if (now >= deadline) {
+		// Past the original budget but the notice hasn't fired yet.
+		// Race window of <1s between the timeout firing and the notice
+		// timer's body running; show "grace: 5m" so the user doesn't
+		// see a stale "0s" flicker.
+		return `⏱ grace: ${formatCountdown(WRAP_UP_GRACE_MS)}`;
+	}
+	return `⏱ ${formatCountdown(deadline - now)}`;
+}
+
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -260,6 +323,16 @@ interface SingleResult {
 	finalOutput?: string;
 	timedOut?: boolean;
 	timeoutMs?: number;
+	/** Wall-clock ms when this subagent invocation started. Used by the
+	 *  renderer to draw a live "time left" countdown against
+	 *  `startedAt + timeoutMs` (or `startedAt + timeoutMs + WRAP_UP_GRACE_MS`
+	 *  once the wrap-up notice has fired). */
+	startedAt?: number;
+	/** Wall-clock ms when the wrap-up notice was delivered to the subagent.
+	 *  Undefined before the notice fires; set inside the notice timer's body
+	 *  so the renderer can switch the countdown from "X left" to
+	 *  "grace: X left" without re-deriving from the constant. */
+	wrapUpStartedAt?: number;
 }
 
 interface SubagentDetails {
@@ -548,6 +621,7 @@ async function runSingleAgent(
 		model: agent.model ?? undefined,
 		step,
 		timeoutMs,
+		startedAt: Date.now(),
 	};
 
 	const emitUpdate = () => {
@@ -576,6 +650,13 @@ async function runSingleAgent(
 			let settled = false;
 			let noticeTimer: NodeJS.Timeout | undefined;
 			let graceTimer: NodeJS.Timeout | undefined;
+			// 1Hz tick that re-pushes the current snapshot through onUpdate
+			// so the renderer's per-row countdown header stays live while
+			// the subagent is still streaming. Cheap (re-runs renderResult
+			// over an unchanged message list) and `.unref()`'d so it never
+			// keeps the event loop alive on its own. Cleared in `finish`
+			// and on `agent_end`.
+			let countdownTimer: NodeJS.Timeout | undefined;
 			// Track whether the agent has already produced a final agent_end
 			// event. RPC mode keeps the subprocess alive after agent_end, so
 			// we close stdin once the agent is done to let it exit. After
@@ -594,6 +675,7 @@ async function runSingleAgent(
 				settled = true;
 				if (noticeTimer) clearTimeout(noticeTimer);
 				if (graceTimer) clearTimeout(graceTimer);
+				if (countdownTimer) clearInterval(countdownTimer);
 				resolve(code);
 			};
 			// Per-invocation uuid so the parent can correlate the meta
@@ -646,6 +728,14 @@ async function runSingleAgent(
 					if (proc.killed || proc.exitCode !== null || agentEnded) return;
 					proc.stdin.write(`${JSON.stringify({ type: "steer", message: WRAP_UP_MESSAGE })}\n`);
 					if (onNotice) onNotice(agentName);
+					// Mark the wall-clock instant the wrap-up notice landed.
+					// The renderer uses this to switch the per-row countdown
+					// from "X left" to "grace: X left" without re-deriving
+					// from the WRAP_UP_GRACE_MS constant. Fire an update
+					// immediately so the label flips on the next render
+					// without waiting up to a second for the interval tick.
+					currentResult.wrapUpStartedAt = Date.now();
+					emitUpdate();
 					graceTimer = setTimeout(
 						() => markTimedOut(`Subagent timed out after ${timeoutMs}ms + ${WRAP_UP_GRACE_MS}ms grace`),
 						WRAP_UP_GRACE_MS,
@@ -653,6 +743,16 @@ async function runSingleAgent(
 					graceTimer.unref();
 				}, timeoutMs);
 				noticeTimer.unref();
+
+				// 1Hz countdown tick. Re-uses the existing onUpdate path
+				// (emitUpdate) so the renderResult re-runs with the new
+				// `Date.now()` for computeCountdownLabel. Re-render is
+				// cheap; the message list is not touched.
+				countdownTimer = setInterval(() => {
+					if (settled) return;
+					emitUpdate();
+				}, 1000);
+				countdownTimer.unref();
 			}
 
 			const processLine = (line: string) => {
@@ -714,6 +814,18 @@ async function runSingleAgent(
 				if (event.type === "agent_end" && !agentEnded) {
 					agentEnded = true;
 					proc.stdin.end();
+					// Drop the countdown tick. The renderer's final pass
+					// will fire from finish() through onUpdate; while
+					// agentEnded is set, computeCountdownLabel returns
+					// null (we still need to stop the interval so it
+					// doesn't keep ticking the parent's renderResult
+					// against a dead subagent). Clear here AND in finish
+					// for the abort-during-grace path, which never emits
+					// agent_end.
+					if (countdownTimer) {
+						clearInterval(countdownTimer);
+						countdownTimer = undefined;
+					}
 				}
 			};
 
@@ -1450,7 +1562,8 @@ export default function (pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, { expanded }, theme, _context) {
+		renderResult(result, options, theme, _context) {
+			const { expanded, isPartial } = options;
 			const details = result.details as SubagentDetails | undefined;
 			if (!details || details.results.length === 0) {
 				const text = result.content[0];
@@ -1481,11 +1594,20 @@ export default function (pi: ExtensionAPI) {
 				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages);
 				const finalOutput = getResultFinalOutput(r);
+				// Live per-row countdown. computeCountdownLabel returns null
+				// for finished/errored/limited-budget invocations, so the tag
+				// only appears while the subagent is still streaming. The
+				// helper internally checks the result fields; the
+				// `isPartial` guard is belt-and-braces in case the runtime
+				// re-runs renderResult after the tool has settled.
+				const countdown = isPartial ? computeCountdownLabel(r, Date.now()) : null;
+				const countdownSuffix = countdown ? ` ${theme.fg("warning", countdown)}` : "";
 
 				if (expanded) {
 					const container = new Container();
 					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+					header += countdownSuffix;
 					container.addChild(new Text(header, 0, 0));
 					if (isError && r.errorMessage)
 						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
@@ -1522,6 +1644,7 @@ export default function (pi: ExtensionAPI) {
 
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+				text += countdownSuffix;
 				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
 				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 				else {
@@ -1567,11 +1690,18 @@ export default function (pi: ExtensionAPI) {
 						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getResultFinalOutput(r);
+						// Chain steps are sequential: only the in-flight step
+						// still has a non-zero `wrapUpStartedAt`/live timer;
+						// earlier steps are already settled and their helper
+						// returns null, so the tag only appears on the active
+						// row during streaming.
+						const countdown = isPartial ? computeCountdownLabel(r, Date.now()) : null;
+						const countdownSuffix = countdown ? ` ${theme.fg("warning", countdown)}` : "";
 
 						container.addChild(new Spacer(1));
 						container.addChild(
 							new Text(
-								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`,
+								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}${countdownSuffix}`,
 								0,
 								0,
 							),
@@ -1618,7 +1748,9 @@ export default function (pi: ExtensionAPI) {
 				for (const r of details.results) {
 					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
+					const countdown = isPartial ? computeCountdownLabel(r, Date.now()) : null;
+					const countdownSuffix = countdown ? ` ${theme.fg("warning", countdown)}` : "";
+					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}${countdownSuffix}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
@@ -1663,10 +1795,20 @@ export default function (pi: ExtensionAPI) {
 						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getResultFinalOutput(r);
+						// Parallel call is "partial" until every task and the
+						// aggregator finish. The per-row helper only returns
+						// a non-null label for the rows that are still
+						// running; settled rows get a clean header.
+						const countdown = isPartial ? computeCountdownLabel(r, Date.now()) : null;
+						const countdownSuffix = countdown ? ` ${theme.fg("warning", countdown)}` : "";
 
 						container.addChild(new Spacer(1));
 						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
+							new Text(
+								`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}${countdownSuffix}`,
+								0,
+								0,
+							),
 						);
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 
@@ -1697,11 +1839,13 @@ export default function (pi: ExtensionAPI) {
 						const rIcon = aggregator.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(aggregator.messages);
 						const finalOutput = getResultFinalOutput(aggregator);
+						const aggCountdown = isPartial ? computeCountdownLabel(aggregator, Date.now()) : null;
+						const aggCountdownSuffix = aggCountdown ? ` ${theme.fg("warning", aggCountdown)}` : "";
 
 						container.addChild(new Spacer(1));
 						container.addChild(
 							new Text(
-								`${theme.fg("muted", "─── fan-in → ") + theme.fg("accent", aggregator.agent)} ${rIcon}`,
+								`${theme.fg("muted", "─── fan-in → ") + theme.fg("accent", aggregator.agent)} ${rIcon}${aggCountdownSuffix}`,
 								0,
 								0,
 							),
@@ -1745,7 +1889,9 @@ export default function (pi: ExtensionAPI) {
 								? theme.fg("success", "✓")
 								: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
+					const countdown = isPartial ? computeCountdownLabel(r, Date.now()) : null;
+					const countdownSuffix = countdown ? ` ${theme.fg("warning", countdown)}` : "";
+					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}${countdownSuffix}`;
 					if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
@@ -1758,7 +1904,9 @@ export default function (pi: ExtensionAPI) {
 								? theme.fg("success", "✓")
 								: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(aggregator.messages);
-					text += `\n\n${theme.fg("muted", "─── fan-in → ")}${theme.fg("accent", aggregator.agent)} ${rIcon}`;
+					const aggCountdown = isPartial ? computeCountdownLabel(aggregator, Date.now()) : null;
+					const aggCountdownSuffix = aggCountdown ? ` ${theme.fg("warning", aggCountdown)}` : "";
+					text += `\n\n${theme.fg("muted", "─── fan-in → ")}${theme.fg("accent", aggregator.agent)} ${rIcon}${aggCountdownSuffix}`;
 					if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", aggregator.exitCode === -1 ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
